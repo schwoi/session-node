@@ -5,9 +5,27 @@ This Dockerfile creates a container for running a Session Stagenet Node based on
 ## Requirements
 
 - Docker installed on your system
-- (Optional) An Arbitrum Sepolia testnet RPC provider URL (defaults to https://sepolia-rollup.arbitrum.io/rpc)
+- An Arbitrum Sepolia testnet RPC provider URL
 - (Optional) A specific public IP address if auto-detection needs to be overridden
 - 20,000 test SESH tokens for staking (5,000 for multicontributor nodes)
+- JSON-RPC Cache Proxy (see setup instructions below)
+
+## JSON-RPC Cache Proxy Setup
+
+Before building the Session node, you'll need to set up the JSON-RPC cache proxy:
+
+1. Clone the proxy repository:
+```bash
+git clone https://github.com/sourcapital/json-rpc-cache-proxy.git
+cd json-rpc-cache-proxy
+```
+
+2. Build the proxy image:
+```bash
+docker build -t json-rpc-cache-proxy .
+```
+
+Update the Arbitrum Sepolia testnet RPC provider URL in the docker-compose.yml file when running the Session node.
 
 ## Building the Image
 
