@@ -1,4 +1,21 @@
 services:
+  json-rpc-cache-proxy:
+    image: json-rpc-cache-proxy
+    ports:
+      - "8080:80"
+    environment:
+      - RPC_ETHEREUM=https://mainnet.infura.io/v3/key
+      - WS_ETHEREUM=wss://mainnet.infura.io/ws/v3/key
+      - RPC_ARBITRUM=https://arbitrum-mainnet.infura.io/v3/key
+      - WS_ARBITRUM=wss://arbitrum-mainnet.infura.io/ws/v3/key
+      - RPC_ARBITRUM-SEPOLIA=https://arbitrum-sepolia.infura.io/v3/key
+      - WS_ARBITRUM-SEPOLIA=https://arbitrum-sepolia.infura.io/ws/v3/key
+      - CACHE_TTL_ETHEREUM=10
+      - CACHE_TTL_ARBITRUM=10
+      - CACHE_TTL_SOLANA=10
+      - CACHE_TTL_ARBITRUM-SEPOLIA=10
+    restart: unless-stopped
+
   stagenet:
     build:
       dockerfile: Dockerfile
@@ -21,6 +38,8 @@ services:
       # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
       - QUORUMNET_PORT=10000
       - P2P_PORT=10001
+      - L2_PROVIDER=http://session-node-json-rpc-cache-proxy-1:8080/arbitrum-sepolia
+  
   stagenet2:
     build:
       dockerfile: Dockerfile
@@ -44,3 +63,4 @@ services:
       # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
       - QUORUMNET_PORT=10002
       - P2P_PORT=10003
+      - L2_PROVIDER=http://session-node-json-rpc-cache-proxy-1:8080/arbitrum-sepolia
