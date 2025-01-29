@@ -17,7 +17,8 @@ services:
         soft: 65535
         hard: 65535
     environment:
-      - SERVICE_NODE_IP_ADDRESS=60.240.226.254
+      # SERVICE_NODE_IP_ADDRESS will be auto-detected if not specified
+      # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
       - QUORUMNET_PORT=10000
       - P2P_PORT=10001
   stagenet2:
@@ -39,6 +40,7 @@ services:
         soft: 65535
         hard: 65535
     environment:
-      - SERVICE_NODE_IP_ADDRESS=60.240.226.254
+      # SERVICE_NODE_IP_ADDRESS will be auto-detected if not specified
+      # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
       - QUORUMNET_PORT=10002
       - P2P_PORT=10003
