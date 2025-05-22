@@ -1,7 +1,7 @@
 #!/bin/bash
 
-DATA_DIR=/var/lib/oxen/stagenet
-LOG_FILE=/var/log/oxen/stagenet.log
+DATA_DIR=/var/lib/oxen/oxen
+LOG_FILE=/var/log/oxen/oxen.log
 
 if [ -z "$SERVICE_NODE_IP_ADDRESS" ]; then
   # Try to get public IP from public IP detection services
@@ -26,6 +26,6 @@ fi
 export DATA_DIR
 export LOG_FILE
 
-envsubst < /etc/oxen/stagenet_template.conf > /etc/oxen/stagenet.conf
+envsubst < /etc/oxen/oxen_template.conf > /etc/oxen/oxen.conf
 
 exec "$@"
