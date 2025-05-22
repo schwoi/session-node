@@ -11,15 +11,13 @@ services:
       - RPC_ARBITRUM-SEPOLIA=https://arbitrum-sepolia.infura.io/v3/key
       - WS_ARBITRUM-SEPOLIA=https://arbitrum-sepolia.infura.io/ws/v3/key
       - CACHE_TTL_ETHEREUM=10
-      - CACHE_TTL_ARBITRUM=10
+      - CACHE_TTL_ARBITRUM=60
       - CACHE_TTL_SOLANA=10
-      - CACHE_TTL_ARBITRUM-SEPOLIA=10
+      - CACHE_TTL_ARBITRUM-SEPOLIA=60
     restart: unless-stopped
 
-  stagenet:
-    build:
-      dockerfile: Dockerfile
-      context: .
+  oxen00:
+    image: registry.schwoi.com/session-node
     ports:
       - "10000:10000"
       - "10001:10001"
@@ -27,7 +25,7 @@ services:
     tty: true
     stdin_open: true
     volumes:
-      - ./oxen:/var/lib/oxen
+      - ./oxen00:/var/lib/oxen
     ulimits:
       nproc: 65535
       nofile:
@@ -40,19 +38,16 @@ services:
       - P2P_PORT=10001
       - L2_PROVIDER=http://session-node-json-rpc-cache-proxy-1:8080/arbitrum-sepolia
   
-  stagenet2:
-    build:
-      dockerfile: Dockerfile
-      context: .
+  oxen01:
+    image: registry.schwoi.com/session-node
+    ports:
+      - "10010:10010"
+      - "10011:10011"
     restart: unless-stopped
-    privileged: true
-    volumes:
-      - ./oxen2:/var/lib/oxen
     tty: true
     stdin_open: true
-    ports:
-      - "10002:10002"
-      - "10003:10003"
+    volumes:
+      - ./oxen01:/var/lib/oxen
     ulimits:
       nproc: 65535
       nofile:
@@ -61,6 +56,7 @@ services:
     environment:
       # SERVICE_NODE_IP_ADDRESS will be auto-detected if not specified
       # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
-      - QUORUMNET_PORT=10002
-      - P2P_PORT=10003
+      - QUORUMNET_PORT=10010
+      - P2P_PORT=10011
       - L2_PROVIDER=http://session-node-json-rpc-cache-proxy-1:8080/arbitrum-sepolia
+  
