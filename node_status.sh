@@ -10,7 +10,11 @@ fi
 
 for container_name in $container_names; do
   echo "Running command on container: $container_name"
-  docker exec -it "$container_name" oxend-stagenet status
+  if echo "$container_name" | grep -q "stagenet"; then
+    docker exec -it "$container_name" oxend-stagenet status
+  else
+    docker exec -it "$container_name" oxend status
+  fi
 done
 
 echo "Status check completed."
