@@ -1,7 +1,7 @@
 #!/bin/bash
 
-DATA_DIR=/var/lib/oxen/oxen
-LOG_FILE=/var/log/oxen/oxen.log
+DATA_DIR=/var/lib/oxen
+LOG_FILE=/var/log/oxen.log
 
 if [ -z "$SERVICE_NODE_IP_ADDRESS" ]; then
   # Try to get public IP from public IP detection services
