@@ -40,7 +40,7 @@ jobs:
       - name: Extract session-service-node version
         id: version
         run: |
-          NODE_VERSION=$(docker run --rm session-node:local dpkg-query -W -f='${Version}' session-service-node)
+          NODE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node)
           echo "node_version=${NODE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Session service node version: ${NODE_VERSION}"
 
