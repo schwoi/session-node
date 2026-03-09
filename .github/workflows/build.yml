@@ -40,7 +40,7 @@ jobs:
       - name: Extract session-service-node version
         id: version
         run: |
-          NODE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node)
+          NODE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node | cut -d'-' -f1)
           if [ -z "$NODE_VERSION" ]; then
             echo "::error::Failed to extract session-service-node version from image"
             exit 1
