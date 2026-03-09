@@ -1,219 +1,187 @@
-# Session Stagenet Node Docker Container
+# Session Node Docker Container
 
-This Dockerfile creates a container for running a Session Stagenet Node based on this [repo](https://github.com/javabudd/session-testnet-multinode-docker) from javabudd just without the AWS dependancies.
+Docker container for running a Session Node on mainnet. Based on this [repo](https://github.com/javabudd/session-testnet-multinode-docker) from javabudd, without the AWS dependencies.
+
+Official docs: https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node
 
 ## Requirements
 
 - Docker installed on your system
-- An Arbitrum Sepolia testnet RPC provider URL
+- An Arbitrum One (mainnet) RPC provider URL (e.g. Infura, Alchemy, dRPC)
 - (Optional) A specific public IP address if auto-detection needs to be overridden
-- 20,000 test SESH tokens for staking (5,000 for multicontributor nodes)
-- JSON-RPC Cache Proxy (see setup instructions below)
+- 25,000 SENT tokens for staking (6,250 for multicontributor nodes) on Arbitrum One
+- Sufficient ETH on Arbitrum One for gas fees
 
-## JSON-RPC Cache Proxy Setup
+## Hardware Requirements
 
-Before building the Session node, you'll need to set up the JSON-RPC cache proxy:
+- **Storage**: 45GB+
+- **RAM**: 4-8GB
+- **Bandwidth**: 100Mb+
+- **Monthly traffic**: 10-20TB minimum
 
-1. Clone the proxy repository:
-```bash
-git clone https://github.com/sourcapital/json-rpc-cache-proxy.git
-cd json-rpc-cache-proxy
-```
+## Required Ports
 
-2. Build the proxy image:
-```bash
-docker build -t json-rpc-cache-proxy .
-```
+Ensure your firewall allows traffic on the following ports:
 
-Update the Arbitrum Sepolia testnet RPC provider URL in the docker-compose.yml file when running the Session node.
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 22020 | TCP & UDP | Storage Server-to-Server |
+| 22021 | TCP | Session Client-to-Storage Server |
+| 22022 | TCP | Blockchain syncing (P2P) |
+| 22025 | TCP | Session Node-to-Node (Quorumnet) |
+| 1090 | UDP | Lokinet router data |
+| 1190 | UDP | Session Router data |
 
 ## Building the Image
 
 ```bash
-docker build -t session-stagenet-node .
+docker build -t session-node .
 ```
 
+## Configuration
+
+Update the `L2_PROVIDER` environment variable in `docker-compose.yml` with your Arbitrum One RPC URL:
+
+```
+L2_PROVIDER=https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+```
+
+### L2 Proxy (Optional)
+
+Instead of pointing each node directly at an RPC provider, oxend has a built-in L2 proxy feature. A dedicated oxend instance can forward Arbitrum updates to your service nodes via quorumnet, reducing external RPC calls. See the [official L2 proxy docs](https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node/setting-up-an-oxend-l2-proxy) for details.
+
 ## Running Multiple Nodes with Docker Compose
-
-This repository includes a `docker-compose.yml` configuration for running multiple Session nodes simultaneously. This is useful for operating multiple nodes under different configurations or for testing purposes.
-
-### Using Docker Compose
 
 ```bash
 # Start all nodes
 docker compose up -d
 
 # Start a specific node
-docker compose up -d stagenet
-docker compose up -d stagenet2
+docker compose up -d oxen00
+docker compose up -d oxen01
 
-# View logs for all nodes
+# View logs
 docker compose logs
-
-# View logs for a specific node
-docker compose logs stagenet
-docker compose logs stagenet2
+docker compose logs oxen00
 
 # Stop all nodes
 docker compose down
 ```
 
-Each node in the compose configuration has:
-- Unique port mappings to avoid conflicts
-- Separate volume mounts for independent data storage
-- Individual environment configurations
+Each node has unique port mappings, separate volume mounts, and individual environment configurations.
 
 ### Node Configurations
 
-The default compose file sets up two nodes with the following configurations:
+1. **First Node (oxen00)** — default mainnet ports:
+   - Quorumnet: 22025, P2P: 22022
+   - Storage: 22020/22021, Lokinet: 1090, Router: 1190
+   - Volume: `./oxen00`
 
-1. First Node (stagenet):
-   - QUORUMNET_PORT: 10000
-   - P2P_PORT: 10001
-   - Volume: ./oxen
-   - IP Address: Auto-detected (can be manually set with SERVICE_NODE_IP_ADDRESS environment variable)
+2. **Second Node (oxen01)** — offset ports:
+   - Quorumnet: 22035, P2P: 22032
+   - Storage: 22030/22031, Lokinet: 1091, Router: 1191
+   - Volume: `./oxen01`
 
-2. Second Node (stagenet2):
-   - QUORUMNET_PORT: 10002
-   - P2P_PORT: 10003
-   - Volume: ./oxen2
-   - IP Address: Auto-detected (can be manually set with SERVICE_NODE_IP_ADDRESS environment variable)
-
-To manually set the IP address in the docker-compose.yml, uncomment and modify the SERVICE_NODE_IP_ADDRESS environment variable:
+To manually set the IP address, uncomment `SERVICE_NODE_IP_ADDRESS` in `docker-compose.yml`:
 ```yaml
 environment:
-  - SERVICE_NODE_IP_ADDRESS=x.x.x.x  # Replace with your specific IP
-  - QUORUMNET_PORT=10000
-  - P2P_PORT=10001
+  - SERVICE_NODE_IP_ADDRESS=x.x.x.x
 ```
 
 ## Running a Single Container
-
-You can run a single container with various configuration options:
 
 ```bash
 # Basic run with auto-detected IP
 docker run -d \
   --name session-node \
-  -p 11022:11022 \
-  -p 11025:11025 \
-  -v session-node-data:/var/lib/oxen/stagenet \
-  session-stagenet-node
+  -e L2_PROVIDER="https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY" \
+  -e QUORUMNET_PORT=22025 \
+  -e P2P_PORT=22022 \
+  -p 22020:22020/tcp -p 22020:22020/udp \
+  -p 22021:22021/tcp \
+  -p 22022:22022/tcp \
+  -p 22025:22025/tcp \
+  -p 1090:1090/udp \
+  -p 1190:1190/udp \
+  -v session-node-data:/var/lib/oxen \
+  session-node
 
 # Run with manually specified IP address
 docker run -d \
   --name session-node \
   -e SERVICE_NODE_IP_ADDRESS="x.x.x.x" \
-  -p 11022:11022 \
-  -p 11025:11025 \
-  -v session-node-data:/var/lib/oxen/stagenet \
-  session-stagenet-node
-
-# Run with custom L2 provider and manual IP
-docker run -d \
-  --name session-node \
-  -e L2_PROVIDER="https://your-l2-provider-url" \
-  -e SERVICE_NODE_IP_ADDRESS="x.x.x.x" \
-  -p 11022:11022 \
-  -p 11025:11025 \
-  -v session-node-data:/var/lib/oxen/stagenet \
-  session-stagenet-node
+  -e L2_PROVIDER="https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY" \
+  -e QUORUMNET_PORT=22025 \
+  -e P2P_PORT=22022 \
+  -p 22020:22020/tcp -p 22020:22020/udp \
+  -p 22021:22021/tcp \
+  -p 22022:22022/tcp \
+  -p 22025:22025/tcp \
+  -p 1090:1090/udp \
+  -p 1190:1190/udp \
+  -v session-node-data:/var/lib/oxen \
+  session-node
 ```
 
 ## Node Registration
 
-After starting the container(s), you'll need to register each node:
+After starting the container(s), register each node:
 
-### For Single Container Setup
-
-1. Get your container's shell:
+### Single Container
 ```bash
-docker exec -it session-node bash
+docker exec -it session-node oxend register [your ETH address]
 ```
 
-2. Register your node (replace with your ETH address):
+### Docker Compose
 ```bash
-oxend-stagenet register [your ETH address]
+docker compose exec oxen00 oxend register [your ETH address]
+docker compose exec oxen01 oxend register [your ETH address]
 ```
 
-### For Docker Compose Setup
-
-1. Access the shell for the specific node:
-```bash
-docker compose exec stagenet bash   # For the first node
-docker compose exec stagenet2 bash  # For the second node
-```
-
-2. Register each node (replace with your ETH address):
-```bash
-oxend-stagenet register [your ETH address]
-```
-
-3. Follow the registration link provided to complete the staking process on the Session website.
+Follow the registration link provided to complete staking on the Session website.
 
 ## Monitoring
 
-### For Single Container Setup
-
-You can monitor your node's status using:
 ```bash
-docker exec session-node oxend-stagenet status
+# Single container
+docker exec session-node oxend status
+docker exec session-node oxend print_sn_status
+
+# Docker Compose
+docker compose exec oxen00 oxend status
+docker compose exec oxen01 oxend status
+
+# Logs
+docker compose logs oxen00
+journalctl -u oxen-node -af  # if running natively
 ```
-
-Or check the logs:
-```bash
-docker logs session-node
-```
-
-### For Docker Compose Setup
-
-Monitor status for specific nodes:
-```bash
-docker compose exec stagenet oxend-stagenet status
-docker compose exec stagenet2 oxend-stagenet status
-```
-
-View logs for all nodes:
-```bash
-docker compose logs
-```
-
-Or for specific nodes:
-```bash
-docker compose logs stagenet
-docker compose logs stagenet2
-```
-
-## Important Notes
-
-- Make sure to back up your node keys after initial setup
-- Keep your L2 provider URL secure and never share it
-- Ensure your firewall allows traffic on ports 11022 and 11025
-- The container uses a Docker volume to persist node data
-- The node's IP address is auto-detected by default, but can be manually specified if needed (e.g., when running behind a NAT or in specific network configurations)
 
 ## Backing Up Keys
 
-### For Single Container Setup
+**Important**: Back up your node keys after initial setup.
 
-To backup your node keys, use:
+### Single Container
 ```bash
-docker exec session-node oxen-sn-keys-snapshot show /var/lib/oxen/stagenet/key_ed25519
-docker exec session-node oxen-sn-keys-snapshot show /var/lib/oxen/stagenet/key_bls
+docker exec session-node oxen-sn-keys show /var/lib/oxen/key_ed25519
+docker exec session-node oxen-sn-keys show /var/lib/oxen/key_bls
 ```
 
-### For Docker Compose Setup
-
-For the first node:
+### Docker Compose
 ```bash
-docker compose exec stagenet oxen-sn-keys-snapshot show /var/lib/oxen/stagenet/key_ed25519
-docker compose exec stagenet oxen-sn-keys-snapshot show /var/lib/oxen/stagenet/key_bls
+# First node
+docker compose exec oxen00 oxen-sn-keys show /var/lib/oxen/key_ed25519
+docker compose exec oxen00 oxen-sn-keys show /var/lib/oxen/key_bls
+
+# Second node
+docker compose exec oxen01 oxen-sn-keys show /var/lib/oxen/key_ed25519
+docker compose exec oxen01 oxen-sn-keys show /var/lib/oxen/key_bls
 ```
 
-For the second node:
-```bash
-docker compose exec stagenet2 oxen-sn-keys-snapshot show /var/lib/oxen/stagenet/key_ed25519
-docker compose exec stagenet2 oxen-sn-keys-snapshot show /var/lib/oxen/stagenet/key_bls
-```
+Store these keys securely — they are required for node recovery.
 
-Store these keys securely - they are required for node recovery if needed.
+## Important Notes
+
+- Keep your L2 provider URL secure and never share it
+- The node's IP address is auto-detected by default but can be manually specified (e.g. behind NAT)
+- The container uses Docker volumes to persist node data
+- SENT tokens must be on Arbitrum One (bridge via the official Arbitrum bridge if needed)
