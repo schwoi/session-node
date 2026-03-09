@@ -1,6 +1,37 @@
 services:
+  # ── L2 Proxy ───────────────────────────────────────────────────
+  # Runs oxend as an L2 proxy that forwards Arbitrum data to service nodes.
+  # Start this first, then get its ed25519 pubkey for the client nodes:
+  #   docker compose exec l2proxy oxen-sn-keys show /var/lib/oxen/key_ed25519
+  # Add that pubkey to L2_OXEND on each service node below.
+  l2proxy:
+    image: ghcr.io/schwoi/session-node:latest
+    ports:
+      - "22125:22125/tcp"
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./l2proxy:/var/lib/oxen
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    environment:
+      - NETWORK=mainnet
+      - ROLE=proxy
+      - QUORUMNET_PORT=22125
+      - P2P_PORT=22126
+      - L2_PROVIDER=https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+      # Comma-separated ed25519 pubkeys of nodes allowed to use this proxy
+      - L2_PROXY_CLIENTS=PUBKEY_OF_OXEN00,PUBKEY_OF_OXEN01
+      # Uncomment for debug logging during initial setup
+      # - L2_PROXY_LOG=1
+
+  # ── Mainnet Nodes ──────────────────────────────────────────────
   oxen00:
-    image: registry.schwoi.com/session-node
+    image: ghcr.io/schwoi/session-node:latest
     ports:
       - "22020:22020/tcp"
       - "22020:22020/udp"
@@ -20,14 +51,17 @@ services:
         soft: 65535
         hard: 65535
     environment:
-      # SERVICE_NODE_IP_ADDRESS will be auto-detected if not set
+      - NETWORK=mainnet
       # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
       - QUORUMNET_PORT=22025
       - P2P_PORT=22022
+      # Option A: Direct RPC (no proxy)
       - L2_PROVIDER=https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+      # Option B: Use L2 proxy (comment out L2_PROVIDER above, uncomment below)
+      # - L2_OXEND=l2proxy:22125/PUBKEY_OF_L2PROXY
 
   oxen01:
-    image: registry.schwoi.com/session-node
+    image: ghcr.io/schwoi/session-node:latest
     ports:
       - "22030:22030/tcp"
       - "22030:22030/udp"
@@ -47,8 +81,66 @@ services:
         soft: 65535
         hard: 65535
     environment:
-      # SERVICE_NODE_IP_ADDRESS will be auto-detected if not set
+      - NETWORK=mainnet
       # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
       - QUORUMNET_PORT=22035
       - P2P_PORT=22032
+      # Option A: Direct RPC (no proxy)
       - L2_PROVIDER=https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+      # Option B: Use L2 proxy (comment out L2_PROVIDER above, uncomment below)
+      # - L2_OXEND=l2proxy:22125/PUBKEY_OF_L2PROXY
+
+  # ── Stagenet Nodes ─────────────────────────────────────────────
+  stagenet00:
+    image: ghcr.io/schwoi/session-node:latest
+    ports:
+      - "11020:11020/tcp"
+      - "11020:11020/udp"
+      - "11021:11021/tcp"
+      - "11022:11022/tcp"
+      - "11025:11025/tcp"
+      - "1092:1092/udp"
+      - "1192:1192/udp"
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./stagenet00:/var/lib/oxen
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    environment:
+      - NETWORK=stagenet
+      # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
+      - QUORUMNET_PORT=11025
+      - P2P_PORT=11022
+      - L2_PROVIDER=https://arbitrum-sepolia.infura.io/v3/YOUR_API_KEY
+
+  stagenet01:
+    image: ghcr.io/schwoi/session-node:latest
+    ports:
+      - "11030:11030/tcp"
+      - "11030:11030/udp"
+      - "11031:11031/tcp"
+      - "11032:11032/tcp"
+      - "11035:11035/tcp"
+      - "1093:1093/udp"
+      - "1193:1193/udp"
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./stagenet01:/var/lib/oxen
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    environment:
+      - NETWORK=stagenet
+      # - SERVICE_NODE_IP_ADDRESS=x.x.x.x
+      - QUORUMNET_PORT=11035
+      - P2P_PORT=11032
+      - L2_PROVIDER=https://arbitrum-sepolia.infura.io/v3/YOUR_API_KEY
