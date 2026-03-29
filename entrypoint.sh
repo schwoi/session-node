@@ -75,4 +75,16 @@ else
   fi
 fi
 
+# Start oxen-storage-server in background (required for uptime proofs)
+if [ "$ROLE" != "proxy" ]; then
+  echo "[config] Starting oxen-storage-server..."
+  oxen-storage-server \
+    --oxend-rpc "ipc://$DATA_DIR/oxend.sock" \
+    --data-dir "$DATA_DIR/storage" \
+    --log-level info \
+    &
+  STORAGE_PID=$!
+  echo "[config] oxen-storage-server started (PID $STORAGE_PID)"
+fi
+
 exec "$@"
