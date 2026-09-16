@@ -54,11 +54,7 @@ with tempfile.TemporaryDirectory(prefix='session-l2-test-') as temp:
         return run('docker', 'compose', *args, cwd=root).stdout
 
     def setup():
-        try:
-            print(run(sys.executable, str(root / 'configure_l2_proxy.py'), cwd=root).stdout, flush=True)
-        except AssertionError:
-            print(compose('--profile', '*', 'logs', '--tail', '40'), flush=True)
-            raise
+        print(run(sys.executable, str(root / 'configure_l2_proxy.py'), cwd=root).stdout, flush=True)
 
     def key(name):
         output = compose('exec', '-T', name, 'curl', '-fsS', '-H', 'Content-Type: application/json',
@@ -114,6 +110,11 @@ with tempfile.TemporaryDirectory(prefix='session-l2-test-') as temp:
         assert result.returncode != 0 and 'user-managed' in result.stderr
         assert (root / 'docker-compose.override.yml').read_text() == original
         print('PASS: public-key discovery, reciprocal config, preserved manual clients, idempotence, added/removed nodes, down/up, override protection')
+    except Exception:
+        # Capture diagnostics before cleanup, including failures during down/up.
+        print(run('docker', 'compose', '--profile', '*', 'logs', '--tail', '80',
+                  cwd=root, check=False).stdout, flush=True)
+        raise
     finally:
         compose('--profile', '*', 'down', '--remove-orphans')
         # Unprivileged daemons own their bind mounts; remove only this test's data.

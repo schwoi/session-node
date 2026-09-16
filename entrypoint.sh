@@ -156,6 +156,8 @@ public-ip=$SERVICE_NODE_IP_ADDRESS
 public-port=$LOKINET_PORT
 [bind]
 inbound=$ROUTER_BIND_IP:$LOKINET_PORT
+[network]
+ifname=lokitun0
 [lokid]
 enabled=true
 rpc=ipc://$NODE_DIR/oxend.sock
@@ -171,13 +173,22 @@ listen=$ROUTER_BIND_IP:$SESSION_ROUTER_PORT
 rpc=ipc://$NODE_DIR/oxend.sock
 CONFIG
   chown root:_loki /etc/oxen/storage.conf /etc/oxen/lokinet.ini /etc/oxen/session-router.ini
-  # Give oxend time to create the authenticated local socket before auxiliaries.
-  for ((attempt=0; attempt<120; attempt++)); do
-    [[ ! -S $NODE_DIR/oxend.sock ]] || break
+  # The data volume can retain a socket from the previous container. Wait for
+  # the new daemon to serve RPC, not just for that socket file to exist, before
+  # companions request their identities. HTTP RPC starts after OxenMQ.
+  ready=0
+  deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
     kill -0 "${pids[0]}" 2>/dev/null || fail 'oxend exited during startup'
+    if [[ -S $NODE_DIR/oxend.sock ]] &&
+      curl --fail --silent --max-time 2 http://127.0.0.1:22023/get_info |
+        jq -e '.status == "OK"' > /dev/null 2>&1; then
+      ready=1
+      break
+    fi
     sleep 1
   done
-  [[ -S $NODE_DIR/oxend.sock ]] || fail 'Timed out waiting for oxend socket'
+  (( ready )) || fail 'Timed out waiting for oxend RPC readiness'
   start oxen-storage --config-file /etc/oxen/storage.conf
   # Match the native router units' capabilities while retaining an unprivileged UID.
   for router in lokinet session-router; do
@@ -186,6 +197,22 @@ CONFIG
       --ambient-caps=+net_admin,+net_bind_service \
       "$router" -r "/etc/oxen/$router.ini" &
     pids+=("$!")
+    if [[ $router == lokinet ]]; then
+      # Both routers auto-select a free private subnet. Let Lokinet install its
+      # tunnel route before Session Router selects one, avoiding a startup race
+      # where both choose 172.16.0.1/16 and one fails with a conflicting IP.
+      ready=0
+      deadline=$((SECONDS + 120))
+      while (( SECONDS < deadline )); do
+        kill -0 "${pids[-1]}" 2>/dev/null || fail 'Lokinet exited during startup'
+        if awk '$1 == "lokitun0" && $2 != "00000000" { found=1 } END { exit !found }' /proc/net/route; then
+          ready=1
+          break
+        fi
+        sleep 1
+      done
+      (( ready )) || fail 'Timed out waiting for Lokinet tunnel readiness'
+    fi
   done
 fi
 

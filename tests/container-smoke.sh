@@ -6,10 +6,12 @@ prefix="session-smoke-$$"
 network="$prefix-net"
 volume="$prefix-data"
 containers=()
+delay_wrapper=$(mktemp)
 cleanup() {
   for container in "${containers[@]}"; do docker rm -f "$container" >/dev/null 2>&1 || true; done
   docker volume rm "$volume" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
+  rm -f "$delay_wrapper"
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -61,6 +63,14 @@ assert_processes() {
       [[ $uid != 0 ]]
     done
     [[ $(awk "/^CapEff:/ {print \$2}" "/proc/${pids[0]}/status") == 0000000000000000 ]]
+    if [[ $1 == 4 ]]; then
+      # Both real tunnel interfaces must have distinct private IPv4 networks.
+      awk '\''
+        $1 == "lokitun0" { loki=$2 }
+        $1 ~ /^sr-tun/ { session=$2 }
+        END { exit !(loki && session && loki != session) }
+      '\'' /proc/net/route
+    fi
   ' -- "$2"
 }
 assert_ports() {
@@ -94,11 +104,30 @@ done
 [[ $(docker inspect -f '{{.State.Running}}' "$main") == false ]] || fail 'Container survived storage failure'
 [[ $(docker inspect -f '{{.State.ExitCode}}' "$main") != 0 ]] || fail 'Storage failure produced successful exit'
 docker rm "$main" >/dev/null
-# Recreation preserves keys and applies all actual offset listeners.
+# A persisted socket must not start companions before the new daemon is ready.
+docker run --rm --network none -v "$volume:/var/lib/oxen" "$image" \
+  bash -c 'test -S /var/lib/oxen/oxend.sock'
+cat > "$delay_wrapper" <<'WRAPPER'
+#!/bin/bash
+touch /var/lib/oxen/oxend-delay-started
+sleep 15
+exec /usr/bin/oxend "$@"
+WRAPPER
+chmod 0755 "$delay_wrapper"
+# Recreation preserves keys and applies all actual offset listeners, even when
+# oxend takes longer to load than the companion services' own startup timeout.
 start "$main" --device /dev/net/tun --cap-add NET_ADMIN -v "$volume:/var/lib/oxen" \
+  -v "$delay_wrapper:/usr/local/bin/oxend:ro" \
   -e P2P_PORT=22032 -e QUORUMNET_PORT=22035 -e STORAGE_LMQ_PORT=22030 \
   -e STORAGE_HTTPS_PORT=22031 -e LOKINET_PORT=1091 -e SESSION_ROUTER_PORT=1191
+for ((attempt=0; attempt<10; attempt++)); do
+  docker exec "$main" test -e /var/lib/oxen/oxend-delay-started && break
+  sleep 1
+done
+docker exec "$main" test -e /var/lib/oxen/oxend-delay-started || fail 'Delayed startup did not begin'
+docker exec "$main" test ! -e /run/session-node.pids || fail 'Companions started against a stale socket'
 await_health "$main"
+assert_processes "$main" 4
 [[ $(docker exec "$main" sha256sum /var/lib/oxen/key_ed25519 /var/lib/oxen/key_bls) == "$keys_before" ]] || fail 'Node identity changed on recreation'
 assert_ports "$main" tcp:22030 udp:22030 tcp:22031 tcp:22032 tcp:22035 udp:1091 udp:1191
 stop_cleanly "$main"
@@ -117,4 +146,4 @@ assert_processes "$proxy" 1
 assert_ports "$proxy" tcp:22125
 docker exec "$proxy" bash -c 'set -e; curl -fsS http://127.0.0.1:22023/get_info | jq -e '\''.service_node == false'\'' >/dev/null; test "$(wc -l < /etc/oxen/proxy.txt)" = 1'
 stop_cleanly "$proxy"
-echo 'PASS: invalid config, mainnet services, offset ports, persisted keys, service failure, stagenet, proxy, graceful shutdown'
+echo 'PASS: invalid config, mainnet services, offset ports, persisted keys, delayed restart with stale socket, service failure, stagenet, proxy, graceful shutdown'
