@@ -13,6 +13,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Increment for container changes that keep the same upstream node version.
+  IMAGE_REVISION: "0"
 
 jobs:
   build:
@@ -33,20 +35,35 @@ jobs:
         with:
           context: .
           load: true
+          pull: true
+          no-cache-filters: packages
           tags: session-node:local
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Extract session-service-node version
+      - name: Smoke test packaged services
+        run: bash tests/container-smoke.sh session-node:local
+
+      - name: Derive image version from installed Session Node
         id: version
         run: |
-          NODE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node | cut -d'~' -f1)
-          if [ -z "$NODE_VERSION" ]; then
-            echo "::error::Failed to extract session-service-node version from image"
+          PACKAGE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node)
+          # Drop an optional Debian epoch and packaging/distribution suffix:
+          # 11.6.1-1~ubuntu2404 -> 11.6.1
+          NODE_VERSION=${PACKAGE_VERSION#*:}
+          NODE_VERSION=${NODE_VERSION%%[-+~]*}
+          if [[ ! "$NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected Session Node package version: $PACKAGE_VERSION"
             exit 1
           fi
+          if [[ ! "$IMAGE_REVISION" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::IMAGE_REVISION must be a non-negative integer"
+            exit 1
+          fi
+          IMAGE_VERSION="${NODE_VERSION}.${IMAGE_REVISION}"
           echo "node_version=${NODE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Session service node version: ${NODE_VERSION}"
+          echo "image_version=${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Session Node package: ${PACKAGE_VERSION}; image: ${IMAGE_VERSION}"
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -59,22 +76,22 @@ jobs:
       - name: Generate tags
         id: meta
         uses: docker/metadata-action@v5
-        env:
-          NODE_VERSION: ${{ steps.version.outputs.node_version }}
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.image_version }},enable={{is_default_branch}}
             type=raw,value=${{ steps.version.outputs.node_version }},enable={{is_default_branch}}
             type=sha
 
-      - name: Build and push
+      # Publish the exact image inspected above, avoiding a second build that
+      # could select a different set of packages.
+      - name: Push tested image
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            docker tag session-node:local "$tag"
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
