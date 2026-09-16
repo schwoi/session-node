@@ -125,13 +125,48 @@ All daemons run as the package's unprivileged `_loki` user; startup briefly runs
 
 An [L2 proxy](https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node/setting-up-an-oxend-l2-proxy) shares RPC requests across nodes. A single proxy is a dependency for all its clients; use multiple independent proxies for resilience.
 
-1. Set `L2_PROVIDER` in `.env`, then start `docker compose up -d --no-build l2proxy`.
-2. Read its public key from `docker compose logs l2proxy`: the L2 proxy startup message lists the listener address and public key.
-3. Start client nodes with direct RPC and read each public key using `docker compose exec oxen00 oxend --config-file=/etc/oxen/oxen.conf print_sn_key` (repeat for `oxen01`).
-4. Set `L2_PROXY_CLIENTS` in `.env` to the client public keys. In each client service's compose environment, remove `L2_PROVIDER` and enable `L2_OXEND=l2proxy:22125/PROXY_PUBLIC_KEY`.
-5. Apply configuration: `docker compose up -d --no-build l2proxy oxen00 oxen01`.
+For nodes in this Compose project, setup can discover both sides automatically.
+Set `L2_PROVIDER` in `.env`, build or pull the image, then run:
 
-Never put secret keys in proxy configuration. A proxy with an empty allowlist starts but does not authorize any clients.
+```bash
+python3 configure_l2_proxy.py
+```
+
+This requires Python 3.9+ on the Docker host and Docker Compose 2.24.4+.
+The command discovers all node services on `l2proxy`'s network in
+`docker-compose.yml`. It starts the proxy, reads public Ed25519 keys using the
+local `get_service_keys` RPC, and starts any unavailable nodes with temporary
+direct RPC access to discover their identities. Private keys stay in each
+container's existing data volume.
+
+It writes `docker-compose.override.yml` with the proxy's allowlist and each
+node's `L2_OXEND` setting, then applies the configuration and waits for health
+checks. The generated override contains only public keys and connection settings;
+RPC credentials remain in `.env`. Manually configured `L2_PROXY_CLIENTS` are
+preserved alongside the discovered nodes. Direct RPC is cleared on the clients.
+
+Normal `docker compose` commands automatically load this override. It also
+enables the proxy and makes the nodes depend on its health, so a later
+`docker compose down` / `up -d` starts everything in order. Rerun the script after
+adding/removing node services or replacing keys; unchanged, running deployments
+are not restarted. This is a repeatable setup command, not a continuous discovery
+service. Node containers may be recreated when their configuration changes.
+
+The script manages the repository's standard Compose layout and refuses to
+replace a user-maintained override file. It does not discover remote hosts.
+Existing network synchronization is not required for key discovery, and passing
+health checks does not prove L2 synchronization or staking readiness.
+
+To return to direct RPC, remove the generated `docker-compose.override.yml` and
+run `docker compose up -d --no-build oxen00 oxen01`. Keep `L2_PROVIDER` configured
+in `.env`.
+
+For manual or remote-proxy setup, obtain node public keys with
+`oxend --config-file=/etc/oxen/oxen.conf print_sn_key`, and the proxy's public key
+from its startup logs. Set `L2_PROXY_CLIENTS` on the proxy, remove `L2_PROVIDER`
+from each client, and set `L2_OXEND=PROXY_HOST:PORT/PROXY_PUBLIC_KEY` there. Never
+use `oxen-sn-keys show` to discover public identities: it also displays secrets.
+An empty proxy allowlist authorizes no clients.
 
 ## Registration and monitoring
 
@@ -169,6 +204,7 @@ bash -n entrypoint.sh healthcheck.sh node_status.sh tests/container-smoke.sh
 docker compose config --quiet
 docker build -t session-node:review .
 bash tests/container-smoke.sh session-node:review
+python3 tests/l2-setup-smoke.py session-node:review
 ```
 
 The smoke checks build configuration, package executables, invalid settings, process supervision and shutdown using isolated temporary containers. They do not register a node or prove public reachability, full synchronization, or successful uptime proofs.

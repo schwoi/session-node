@@ -44,6 +44,9 @@ jobs:
       - name: Smoke test packaged services
         run: bash tests/container-smoke.sh session-node:local
 
+      - name: Smoke test automatic L2 proxy setup
+        run: python3 tests/l2-setup-smoke.py session-node:local
+
       - name: Derive image version from installed Session Node
         id: version
         run: |
