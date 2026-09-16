@@ -37,6 +37,52 @@ Use `docker compose pull oxen00` followed by `docker compose up -d --no-build ox
 The tag name does not pin packages during a local build; local builds still select
 current stable packages.
 
+## Guided node onboarding
+
+Run the interactive wizard from a terminal on the Docker host:
+
+```bash
+./onboard-node.sh
+```
+
+It guides you through adding a named node or editing an existing one: network,
+image version, data directory, public IPv4, port assignments, direct/proxy L2
+access, and new or imported identity. It suggests unused ports and checks for
+conflicts with other services in this Compose project. Check the host firewall
+and other applications separately.
+
+The wizard requires Docker/Compose and Python 3.9+ with `venv` support. On first
+use it offers to install its pinned YAML dependency in `.onboarding-venv`.
+It preserves unrelated Compose services, comments, and variable references.
+Public settings go into `docker-compose.yml`; RPC credentials are entered with
+hidden input and stored in `.env` under a per-node variable (or `L2_PROVIDER` for
+the shared local proxy). Imported key material never goes into Compose or `.env`.
+
+Before saving, it shows a summary and validates the result. Saving stops the
+selected node if it is running, makes a private backup in `.onboarding-backups`,
+and updates the files. It then offers to start the node. Cancelling the review
+leaves node configuration and keys untouched. Existing nodes retain their data
+and identity; changing networks requires a new service and directory.
+
+For migration, select `import` and provide paths to **both** `key_ed25519` and
+`key_bls` copied from the old node. Binary and hexadecimal key files are accepted.
+The selected container image validates them offline. The wizard shows the imported
+public identity, copies the keys with mode `0600`, preserves the source files,
+and refuses to overwrite a different or incomplete destination identity. Use an
+empty destination, or a data directory already containing the same complete keys.
+Key-only import does not copy the blockchain or storage database; a fresh data
+directory will need to synchronize. Importing legacy pre-Oxen-11 `key` files or
+pasted 32-byte Ed25519 seeds is not supported.
+
+The original node must be stopped before starting its replacement; the wizard
+asks for confirmation at that point. Saving a migration without starting it is
+supported. Starting two nodes with the same identity must be avoided.
+
+Selecting `local` L2 mode runs the automatic proxy setup when you approve startup.
+Nodes configured as `direct` or external `proxy` opt out of automatic local
+rewiring using `L2_AUTO_PROXY=0`. When changing a formerly local node to direct or
+external access, rerun `configure_l2_proxy.py` to refresh the proxy's allowlist.
+
 ## Build and run
 
 ```bash
@@ -92,6 +138,7 @@ Keep `.env` private; it is ignored by Git. Environment values are visible to use
 | `ROLE` | `node` | `node` or `proxy` |
 | `L2_PROVIDER` | Required unless using proxy | HTTP(S) RPC URL; comma/newline-separated URLs provide fallback providers |
 | `L2_OXEND` | Empty | Comma/newline-separated `host:port/pubkey` proxy addresses; mutually exclusive with `L2_PROVIDER` |
+| `L2_AUTO_PROXY` | `1` | `0` excludes this node from automatic local proxy configuration |
 | `L2_PROXY_CLIENTS` | Empty (no authorized clients) | Comma/newline-separated 64-character hex public keys |
 | `L2_PROXY_LOG` | `0` | `1` enables proxy debug logs |
 | `SERVICE_NODE_IP_ADDRESS` | Auto-detect | Public IPv4; explicit configuration is recommended behind NAT |
@@ -133,7 +180,7 @@ python3 configure_l2_proxy.py
 ```
 
 This requires Python 3.9+ on the Docker host and Docker Compose 2.24.4+.
-The command discovers all node services on `l2proxy`'s network in
+The command discovers participating node services on `l2proxy`'s network in
 `docker-compose.yml`. It starts the proxy, reads public Ed25519 keys using the
 local `get_service_keys` RPC, and starts any unavailable nodes with temporary
 direct RPC access to discover their identities. Private keys stay in each
@@ -205,6 +252,7 @@ docker compose config --quiet
 docker build -t session-node:review .
 bash tests/container-smoke.sh session-node:review
 python3 tests/l2-setup-smoke.py session-node:review
+.onboarding-venv/bin/python tests/test_onboarding.py
 ```
 
 The smoke checks build configuration, package executables, invalid settings, process supervision and shutdown using isolated temporary containers. They do not register a node or prove public reachability, full synchronization, or successful uptime proofs.
