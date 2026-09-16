@@ -4,3 +4,7 @@
 /oxen01/
 /stagenet00/
 /stagenet01/
+/docker-compose.override.yml
+/.l2-setup-*/
+/.l2-setup.lock
+__pycache__/
