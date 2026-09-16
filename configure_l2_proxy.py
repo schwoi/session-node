@@ -90,6 +90,10 @@ def setup():
     current = [base, override] if override.exists() else [base]
     config = json.loads(compose([base], '--profile', '*', 'config', '--format', 'json').stdout)
     services = config['services']
+    # Rendered Compose values escape literal dollars; restore actual env values.
+    for service in services.values():
+        service['environment'] = {key: value.replace('$$', '$') if isinstance(value, str) else value
+                                  for key, value in service.get('environment', {}).items()}
     proxy = 'l2proxy'
     proxy_env = services.get(proxy, {}).get('environment', {})
     if proxy_env.get('ROLE') != 'proxy':
@@ -100,7 +104,8 @@ def setup():
         raise SetupError('Set a real L2_PROVIDER in .env before running setup.')
     clients = sorted(name for name, service in services.items()
                      if name != proxy and service.get('environment', {}).get('ROLE', 'node') == 'node'
-                     and service.get('environment', {}).get('NETWORK', 'mainnet') == network)
+                     and service.get('environment', {}).get('NETWORK', 'mainnet') == network
+                     and service.get('environment', {}).get('L2_AUTO_PROXY', '1') != '0')
     if not clients:
         raise SetupError('No nodes on the proxy\'s network were found in docker-compose.yml.')
     port = str(proxy_env.get('QUORUMNET_PORT', '11025' if network == 'stagenet' else '22025'))
@@ -119,7 +124,7 @@ def setup():
             previous = json.loads(override.read_text()[len(MARKER):].replace(
                 '"profiles": !reset []', '"profiles": []'))
             previous['services'] = {name: value for name, value in previous['services'].items()
-                                    if name in services}
+                                    if name == proxy or name in clients}
             filtered = Path(temp) / 'current.yml'
             filtered.write_text(dump_override(previous))
             current = [base, filtered]

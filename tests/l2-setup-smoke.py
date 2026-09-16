@@ -44,6 +44,9 @@ with tempfile.TemporaryDirectory(prefix='session-l2-test-') as temp:
     config = {'name': f'session-l2-test-{os.getpid()}',
               'services': {'l2proxy': service('proxy'), 'node0': service('node0'), 'node1': service('node1')},
               'networks': {'default': {'internal': True}}}
+    config['services']['direct'] = service('direct')
+    config['services']['direct']['environment']['L2_AUTO_PROXY'] = '0'
+    config['services']['direct']['profiles'] = ['manual']
     base = root / 'docker-compose.yml'
     base.write_text(json.dumps(config))
 
@@ -51,7 +54,11 @@ with tempfile.TemporaryDirectory(prefix='session-l2-test-') as temp:
         return run('docker', 'compose', *args, cwd=root).stdout
 
     def setup():
-        print(run(sys.executable, str(root / 'configure_l2_proxy.py'), cwd=root).stdout, flush=True)
+        try:
+            print(run(sys.executable, str(root / 'configure_l2_proxy.py'), cwd=root).stdout, flush=True)
+        except AssertionError:
+            print(compose('--profile', '*', 'logs', '--tail', '40'), flush=True)
+            raise
 
     def key(name):
         output = compose('exec', '-T', name, 'curl', '-fsS', '-H', 'Content-Type: application/json',
@@ -73,17 +80,18 @@ with tempfile.TemporaryDirectory(prefix='session-l2-test-') as temp:
             assert effective['services'][name]['depends_on']['l2proxy']['condition'] == 'service_healthy'
         generated = (root / 'docker-compose.override.yml').read_text()
         assert 'http://127.0.0.1:8545' not in generated
+        assert '"direct"' not in generated
 
     try:
         setup()
         verify(['node0', 'node1'])
         ids = compose('ps', '-q')
         generated = (root / 'docker-compose.override.yml').read_bytes()
-        identities = {name: key(name) for name in config['services']}
+        identities = {name: key(name) for name in config['services'] if name != 'direct'}
         setup()
         assert compose('ps', '-q') == ids, 'Idempotent setup restarted existing containers'
         assert (root / 'docker-compose.override.yml').read_bytes() == generated
-        assert identities == {name: key(name) for name in config['services']}
+        assert identities == {name: key(name) for name in config['services'] if name != 'direct'}
         config['services']['node2'] = service('node2')
         base.write_text(json.dumps(config))
         setup()
@@ -111,4 +119,4 @@ with tempfile.TemporaryDirectory(prefix='session-l2-test-') as temp:
         # Unprivileged daemons own their bind mounts; remove only this test's data.
         run('docker', 'run', '--rm', '--network', 'none', '-v', f'{root}:/test',
             '--entrypoint', 'sh', IMAGE, '-c',
-            'rm -rf /test/proxy /test/node0 /test/node1 /test/node2', cwd=root)
+            'rm -rf /test/proxy /test/node0 /test/node1 /test/node2 /test/direct', cwd=root)

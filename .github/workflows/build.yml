@@ -47,6 +47,15 @@ jobs:
       - name: Smoke test automatic L2 proxy setup
         run: python3 tests/l2-setup-smoke.py session-node:local
 
+      - name: Test onboarding configuration and key migration
+        env:
+          ONBOARDING_TEST_IMAGE: session-node:local
+        run: |
+          python3 -m venv .onboarding-venv
+          .onboarding-venv/bin/pip install -r requirements-onboarding.txt
+          bash -n onboard-node.sh
+          .onboarding-venv/bin/python tests/test_onboarding.py
+
       - name: Derive image version from installed Session Node
         id: version
         run: |

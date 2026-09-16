@@ -8,3 +8,7 @@
 /.l2-setup-*/
 /.l2-setup.lock
 __pycache__/
+/.onboarding-venv/
+/.node-onboarding.*/
+/.onboarding-backups/
+/data/
