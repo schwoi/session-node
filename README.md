@@ -1,212 +1,174 @@
 # Session Node Docker Container
 
-Docker container for running Session Nodes on mainnet and/or stagenet. Based on this [repo](https://github.com/javabudd/session-testnet-multinode-docker) from javabudd, without the AWS dependencies.
+Container packaging for Session Nodes on mainnet and stagenet, based on [javabudd's original project](https://github.com/javabudd/session-testnet-multinode-docker).
 
-Official docs: https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node
+The [official guide](https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node) describes native Ubuntu/Debian services. This is community container packaging of those same stable packages, not an officially endorsed Docker image. See the [documentation review](docs/container-review.md) for sources and findings.
 
-## Requirements
+## Versions and requirements
 
-- Docker installed on your system
-- An RPC provider URL:
-  - **Mainnet**: Arbitrum One (e.g. Infura, Alchemy, dRPC)
-  - **Stagenet**: Arbitrum Sepolia
-- (Optional) A specific public IP address if auto-detection needs to be overridden
+The image uses Ubuntu 24.04 LTS and the signed `deb.session.foundation` stable repository. Verified on 16 September 2026: `session-service-node`/`oxend` **11.6.1**, storage **2.11.3**, Lokinet **0.9.14**, Session Router **1.0.2**. Uncached builds select the latest available stable packages, rather than freezing these versions.
 
-### Staking
+Each mainnet node needs at least 45 GB storage, 4–8 GB RAM, 100 Mb/s connectivity, and 10–20 TB monthly traffic allowance. Allow additional capacity when running multiple nodes. Use Docker Engine with the Compose plugin and a publicly reachable IPv4 address.
 
-| Network | Solo Operator | Multi-Contributor Min |
-|---------|--------------|----------------------|
-| Mainnet | 25,000 SENT on Arbitrum One | 6,250 SENT |
-| Stagenet | 20,000 test SESH on Arbitrum Sepolia | 5,000 test SESH |
+Mainnet requires an Arbitrum One RPC provider and 25,000 **SESH** for solo staking (minimum operator contribution 6,250 SESH for a shared node). SESH and gas ETH must be on Arbitrum One. Stagenet uses Arbitrum Sepolia and test tokens; consult the [testnet guide](https://docs.getsession.org/contribute-to-the-session-network/testnet/session-stagenet-node-setup) for current staking details.
 
-## Hardware Requirements
+## Image versions
 
-- **Storage**: 45GB+
-- **RAM**: 4-8GB
-- **Bandwidth**: 100Mb+
-- **Monthly traffic**: 10-20TB minimum
+CI derives image tags from the `session-service-node` package actually installed
+in the tested image. For example, package `11.6.1-1~ubuntu2404` produces image
+`ghcr.io/schwoi/session-node:11.6.1.0`: the first three numbers are the upstream
+Session Node version; the fourth is the container revision.
 
-## Required Ports
+`IMAGE_REVISION` in `.github/workflows/build.yml` starts at `0`. Increment it for
+container changes released against the same node version (`11.6.1.1`, etc.). The
+upstream portion updates automatically when newer stable packages are installed;
+the container revision stays at its configured value until explicitly changed.
+CI also publishes the `11.6.1`, `latest`, and commit-SHA aliases. Scheduled rebuilds
+can refresh dependencies under the same tags; use an image digest when you need
+an exact, immutable build.
 
-Ensure your firewall allows traffic on the following ports (defaults shown for mainnet / stagenet):
+After publication, select a version by setting this in `.env` and pulling it:
 
-| Port (mainnet) | Port (stagenet) | Protocol | Purpose |
-|----------------|-----------------|----------|---------|
-| 22020 | 11020 | TCP & UDP | Storage Server-to-Server |
-| 22021 | 11021 | TCP | Session Client-to-Storage Server |
-| 22022 | 11022 | TCP | Blockchain syncing (P2P) |
-| 22025 | 11025 | TCP | Session Node-to-Node (Quorumnet) |
-| 1090 | 1092 | UDP | Lokinet router data |
-| 1190 | 1192 | UDP | Session Router data |
+```dotenv
+SESSION_NODE_IMAGE=ghcr.io/schwoi/session-node:11.6.1.0
+```
 
-Second nodes on the same host use offset ports (see `docker-compose.yml`).
+Use `docker compose pull oxen00` followed by `docker compose up -d --no-build oxen00`.
+The tag name does not pin packages during a local build; local builds still select
+current stable packages.
 
-## Building the Image
+## Build and run
 
 ```bash
-docker build -t session-node .
+cp .env.example .env
+# Edit .env: set your Arbitrum RPC URL and, if needed, public IPv4.
+docker compose build --pull --no-cache oxen00
+docker compose up -d --no-build oxen00
+
+docker compose logs --tail 100 -f oxen00
 ```
+
+Building locally uses the changes in this checkout. To use a published image instead, run `docker compose pull oxen00` before `docker compose up -d --no-build oxen00`. The registry image only acquires these changes after they are published.
+
+`oxen00` and `oxen01` are mainnet nodes. Proxy and stagenet services have optional profiles; explicitly naming a service starts it without enabling its profile. A bare `docker compose up -d` starts both mainnet nodes.
+
+```bash
+# Additional mainnet node, with separate data and ports
+docker compose up -d --no-build oxen01
+
+# Set STAGENET_L2_PROVIDER in .env first
+docker compose up -d --no-build stagenet00 stagenet01
+
+# Gracefully stop all services, retaining bind-mounted data
+docker compose --profile '*' down
+```
+
+Mainnet runs `oxend`, `oxen-storage`, `lokinet`, and `session-router`. Current stagenet runs only `oxend`: its network configuration disables storage and both routers. L2 proxy mode also runs only `oxend`, as a regular full node.
+
+## Networking
+
+Open/forward these ports to the Docker host. Published ports, listening ports and advertised public ports must agree; the compose file configures offsets for the second mainnet node.
+
+| Purpose | Mainnet 00 | Mainnet 01 | Protocol |
+|---------|------------|------------|----------|
+| Storage server-to-server | 22020 | 22030 | TCP and UDP |
+| Storage client HTTPS | 22021 | 22031 | TCP |
+| Blockchain P2P | 22022 | 22032 | TCP |
+| Quorumnet | 22025 | 22035 | TCP |
+| Lokinet relay | 1090 | 1091 | UDP |
+| Session Router relay | 1190 | 1191 | UDP |
+
+Stagenet exposes only P2P (11022 / 11032 TCP) and Quorumnet (11025 / 11035 TCP). The optional L2 proxy exposes 22125 TCP. Admin RPC binds to container loopback and is not published. Docker-published ports can bypass host UFW rules; apply filtering at the Docker forwarding chain or upstream firewall as appropriate.
+
+The compose file uses bridge networking and gives mainnet routers `/dev/net/tun` and `NET_ADMIN`, matching their native service requirements. Router processes retain only the additional networking capabilities they need; oxend and storage run without capabilities. Routers are explicitly configured with the public IPv4 and listening ports. Reachability still depends on your host, NAT and provider firewall.
 
 ## Configuration
 
-### Environment Variables
+Keep `.env` private; it is ignored by Git. Environment values are visible to users with Docker access. Never commit RPC credentials or node data.
 
-| Variable | Values | Default | Description |
-|----------|--------|---------|-------------|
-| `NETWORK` | `mainnet`, `stagenet` | `mainnet` | Which network to join |
-| `ROLE` | `node`, `proxy` | `node` | Run as service node or L2 proxy |
-| `L2_PROVIDER` | URL | — | Direct Arbitrum RPC URL |
-| `L2_OXEND` | `host:port/pubkey,...` | — | Connect to L2 proxy instead of direct RPC |
-| `L2_PROXY_CLIENTS` | `pubkey,pubkey,...` | — | Pubkeys allowed to use this proxy (when `ROLE=proxy`) |
-| `L2_PROXY_LOG` | `1` | — | Enable debug logging for proxy (when `ROLE=proxy`) |
-| `SERVICE_NODE_IP_ADDRESS` | IP | auto-detected | Public IP override |
-| `QUORUMNET_PORT` | port | — | Quorumnet listening port |
-| `P2P_PORT` | port | — | P2P listening port |
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `NETWORK` | `mainnet` | `mainnet` or `stagenet` |
+| `ROLE` | `node` | `node` or `proxy` |
+| `L2_PROVIDER` | Required unless using proxy | HTTP(S) RPC URL; comma/newline-separated URLs provide fallback providers |
+| `L2_OXEND` | Empty | Comma/newline-separated `host:port/pubkey` proxy addresses; mutually exclusive with `L2_PROVIDER` |
+| `L2_PROXY_CLIENTS` | Empty (no authorized clients) | Comma/newline-separated 64-character hex public keys |
+| `L2_PROXY_LOG` | `0` | `1` enables proxy debug logs |
+| `SERVICE_NODE_IP_ADDRESS` | Auto-detect | Public IPv4; explicit configuration is recommended behind NAT |
+| `ROUTER_BIND_IP` | Container IPv4 | Local router bind address, separate from the advertised public IPv4 |
+| `P2P_PORT` | 22022 / 11022 | Mainnet / stagenet P2P port |
+| `QUORUMNET_PORT` | 22025 / 11025 | Quorumnet port, or the LMQ listener for proxy mode |
+| `STORAGE_LMQ_PORT` | 22020 | Mainnet storage TCP/UDP port |
+| `STORAGE_HTTPS_PORT` | 22021 | Mainnet storage HTTPS port |
+| `LOKINET_PORT` | 1090 | Mainnet Lokinet UDP port |
+| `SESSION_ROUTER_PORT` | 1190 | Mainnet Session Router UDP port |
 
-Update `L2_PROVIDER` in `docker-compose.yml` with your RPC URL:
-- **Mainnet**: `https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY`
-- **Stagenet**: `https://arbitrum-sepolia.infura.io/v3/YOUR_API_KEY`
+Compose also accepts `STAGENET_L2_PROVIDER` for its stagenet services and `SESSION_NODE_IMAGE` to override the image tag. It passes `L2_PROVIDER` from `.env` to both mainnet services and the proxy.
 
-### L2 Proxy Setup (Optional)
+`entrypoint.sh` generates `/etc/oxen/oxen.conf` at every startup from the
+variables above. The previous `etc/oxen/oxen.conf` in this repository was only an
+`envsubst` template; its settings now live in the entrypoint alongside the
+network/role-specific logic. The runtime config file still exists and `oxend`
+continues to read it with `--config-file=/etc/oxen/oxen.conf`.
 
-Instead of each node making its own RPC calls, you can run one container as an L2 proxy that forwards Arbitrum data to your service nodes. This reduces RPC usage and costs. See the [official L2 proxy docs](https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node/setting-up-an-oxend-l2-proxy) for details.
+For persistent configuration changes, edit `.env` or the service environment in
+`docker-compose.yml`, then recreate the container with `docker compose up -d
+--no-build oxen00`. Direct edits to `/etc/oxen/oxen.conf` are overwritten on the
+next start. Settings without an environment option currently require an
+entrypoint change and image rebuild. Mainnet startup also generates
+`/etc/oxen/storage.conf`, `/etc/oxen/lokinet.ini`, and
+`/etc/oxen/session-router.ini`.
 
-The `docker-compose.yml` includes an `l2proxy` service pre-configured for this. Setup:
+All daemons run as the package's unprivileged `_loki` user; startup briefly runs as root to prepare configuration and migrate ownership of existing root-owned data. Each service's entire `/var/lib/oxen` directory must be persisted. Router data lives below it alongside blockchain and storage data. Tini reaps orphan processes; the entrypoint stops all services if any required daemon exits, allowing Docker's restart policy to recover. Compose allows two minutes for shutdown and rotates container logs. `oxend` also maintains its own rotating log in its persistent data directory.
 
-**Step 1** — Start the proxy first:
-```bash
-docker compose up -d l2proxy
-```
+## Optional L2 proxy
 
-**Step 2** — Get the proxy's ed25519 pubkey:
-```bash
-docker compose exec l2proxy oxen-sn-keys show /var/lib/oxen/key_ed25519
-```
+An [L2 proxy](https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node/setting-up-an-oxend-l2-proxy) shares RPC requests across nodes. A single proxy is a dependency for all its clients; use multiple independent proxies for resilience.
 
-**Step 3** — Get each service node's ed25519 pubkey (start them with direct RPC first):
-```bash
-docker compose up -d oxen00 oxen01
-docker compose exec oxen00 oxen-sn-keys show /var/lib/oxen/key_ed25519
-docker compose exec oxen01 oxen-sn-keys show /var/lib/oxen/key_ed25519
-```
+1. Set `L2_PROVIDER` in `.env`, then start `docker compose up -d --no-build l2proxy`.
+2. Read its public key from `docker compose logs l2proxy`: the L2 proxy startup message lists the listener address and public key.
+3. Start client nodes with direct RPC and read each public key using `docker compose exec oxen00 oxend --config-file=/etc/oxen/oxen.conf print_sn_key` (repeat for `oxen01`).
+4. Set `L2_PROXY_CLIENTS` in `.env` to the client public keys. In each client service's compose environment, remove `L2_PROVIDER` and enable `L2_OXEND=l2proxy:22125/PROXY_PUBLIC_KEY`.
+5. Apply configuration: `docker compose up -d --no-build l2proxy oxen00 oxen01`.
 
-**Step 4** — Update `docker-compose.yml`:
-- Set `L2_PROXY_CLIENTS` on the proxy to the service node pubkeys
-- On each service node, comment out `L2_PROVIDER` and uncomment `L2_OXEND` with the proxy's pubkey
+Never put secret keys in proxy configuration. A proxy with an empty allowlist starts but does not authorize any clients.
 
-**Step 5** — Restart everything:
-```bash
-docker compose up -d
-```
+## Registration and monitoring
 
-The proxy doesn't need to be a registered service node — it just forwards L2 data. Within Docker Compose, nodes reach the proxy via its service name (`l2proxy:22125`).
-
-## Running with Docker Compose
-
-The compose file includes both mainnet (`oxen00`, `oxen01`) and stagenet (`stagenet00`, `stagenet01`) services.
+Use the generated configuration explicitly so commands select the right network and ports:
 
 ```bash
-# Start mainnet nodes only
-docker compose up -d oxen00 oxen01
+docker compose exec oxen00 oxend --config-file=/etc/oxen/oxen.conf status
+docker compose exec oxen00 oxend --config-file=/etc/oxen/oxen.conf print_sn_status
+docker compose exec oxen00 oxend --config-file=/etc/oxen/oxen.conf register YOUR_ETH_ADDRESS
 
-# Start stagenet nodes only
-docker compose up -d stagenet00 stagenet01
-
-# Start everything
-docker compose up -d
-
-# View logs
-docker compose logs oxen00
-docker compose logs stagenet00
-
-# Stop all nodes
-docker compose down
+# Same commands work for stagenet by changing the service name
+docker compose exec stagenet00 oxend --config-file=/etc/oxen/oxen.conf status
+bash node_status.sh
 ```
 
-## Running a Single Container
+Follow the registration URL to stake. Before staking, verify full chain/L2 synchronization, externally reachable ports, and healthy storage/router reports. A successful container start alone does not prove network eligibility. The Docker health check verifies local RPC and recent pings from all required companions; it does not require chain synchronization. An unhealthy status needs investigation: Docker restart policies handle process exits, but do not automatically restart a container solely because its health check fails.
+
+## Updates and backups
+
+Back up **the actual private key files**. `oxen-sn-keys show` displays secret key material as well as the public key; keep its output private. Both networks use `/var/lib/oxen/key_ed25519` and `/var/lib/oxen/key_bls` in their separate volumes. The explicit `data-dir` preserves the original container's paths; native installations may use network subdirectories. Keep encrypted/offline backups with restricted access. A stopped-container backup of the entire bind-mounted data directory also preserves storage and router state. Never run two containers with the same node keys simultaneously.
 
 ```bash
-# Mainnet
-docker run -d \
-  --name session-node \
-  -e NETWORK=mainnet \
-  -e L2_PROVIDER="https://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY" \
-  -e QUORUMNET_PORT=22025 \
-  -e P2P_PORT=22022 \
-  -p 22020:22020/tcp -p 22020:22020/udp \
-  -p 22021:22021/tcp \
-  -p 22022:22022/tcp \
-  -p 22025:22025/tcp \
-  -p 1090:1090/udp \
-  -p 1190:1190/udp \
-  -v session-node-data:/var/lib/oxen \
-  session-node
-
-# Stagenet
-docker run -d \
-  --name session-node-stagenet \
-  -e NETWORK=stagenet \
-  -e L2_PROVIDER="https://arbitrum-sepolia.infura.io/v3/YOUR_API_KEY" \
-  -e QUORUMNET_PORT=11025 \
-  -e P2P_PORT=11022 \
-  -p 11020:11020/tcp -p 11020:11020/udp \
-  -p 11021:11021/tcp \
-  -p 11022:11022/tcp \
-  -p 11025:11025/tcp \
-  -p 1092:1092/udp \
-  -p 1192:1192/udp \
-  -v session-node-stagenet-data:/var/lib/oxen \
-  session-node
+# Rebuild from current stable packages, then recreate one node at a time
+docker compose build --pull --no-cache oxen00
+docker compose up -d --no-build oxen00
+docker compose exec oxen00 dpkg-query -W session-service-node oxen-storage-server lokinet-router session-router-relay
 ```
 
-## Node Registration
+For registry installations, use `docker compose pull` and recreate instead. CI rebuilds weekly with the package stage cache disabled and pushes the exact inspected image. Updates are not automatically applied to running containers. Preserve the previous image digest and data backup for recovery; package upgrades can change database formats, so do not assume an older image can read upgraded data.
+
+## Validation
 
 ```bash
-# Mainnet
-docker compose exec oxen00 oxend register [your ETH address]
-
-# Stagenet
-docker compose exec stagenet00 oxend-stagenet register [your ETH address]
+bash -n entrypoint.sh healthcheck.sh node_status.sh tests/container-smoke.sh
+docker compose config --quiet
+docker build -t session-node:review .
+bash tests/container-smoke.sh session-node:review
 ```
 
-Follow the registration link to complete staking on the Session website.
-
-## Monitoring
-
-```bash
-# Mainnet
-docker compose exec oxen00 oxend status
-docker compose exec oxen00 oxend print_sn_status
-
-# Stagenet
-docker compose exec stagenet00 oxend-stagenet status
-```
-
-Or use the included helper script to check all running nodes:
-```bash
-./node_status.sh
-```
-
-## Backing Up Keys
-
-**Important**: Back up your node keys after initial setup.
-
-```bash
-# Mainnet
-docker compose exec oxen00 oxen-sn-keys show /var/lib/oxen/key_ed25519
-docker compose exec oxen00 oxen-sn-keys show /var/lib/oxen/key_bls
-
-# Stagenet
-docker compose exec stagenet00 oxen-sn-keys show /var/lib/oxen/key_ed25519
-docker compose exec stagenet00 oxen-sn-keys show /var/lib/oxen/key_bls
-```
-
-Store these keys securely — they are required for node recovery.
-
-## Important Notes
-
-- Keep your L2 provider URL secure and never share it
-- The node's IP address is auto-detected by default but can be manually specified (e.g. behind NAT)
-- The container uses Docker volumes to persist node data
-- Mainnet SENT tokens must be on Arbitrum One (bridge via the official Arbitrum bridge if needed)
-- Mainnet and stagenet nodes use separate data directories and ports, so they can coexist on the same host
+The smoke checks build configuration, package executables, invalid settings, process supervision and shutdown using isolated temporary containers. They do not register a node or prove public reachability, full synchronization, or successful uptime proofs.

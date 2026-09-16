@@ -1,20 +1,7 @@
 #!/bin/bash
-
-echo "Searching for session node containers"
-container_names=$(docker ps --format '{{.Names}}' | grep "session-node")
-
-if [ -z "$container_names" ]; then
-  echo "No containers with 'session-node' in the name found."
-  exit 0
-fi
-
-for container_name in $container_names; do
-  echo "Running command on container: $container_name"
-  if echo "$container_name" | grep -q "stagenet"; then
-    docker exec -it "$container_name" oxend-stagenet status
-  else
-    docker exec -it "$container_name" oxend status
-  fi
-done
-
-echo "Status check completed."
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+while IFS= read -r service; do
+  echo "Status: $service"
+  docker compose exec -T "$service" oxend --config-file=/etc/oxen/oxen.conf status
+done < <(docker compose ps --services --status running)
