@@ -184,7 +184,7 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=6
+TOTAL_STAGES=7
 [[ -t 0 ]] || { printf '%sRun this wizard in an interactive terminal.%s\n' "$RED" "$RESET" >&2; exit 1; }
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$ROOT"
@@ -255,7 +255,8 @@ ask DATA_DIR 'Persistent data directory (Enter keeps current):'
 save_answer DATA_DIR
 
 stage 'Public address and ports'
-say 'Open/forward these ports on the server firewall. Published and listening ports will match.'
+say 'Published and listening ports will match. After startup you can configure the host UFW firewall.'
+say 'Any provider firewall or upstream port forwarding must also allow these ports.'
 ask PUBLIC_IP 'Public IPv4 (auto for automatic detection):'
 [[ $PUBLIC_IP != auto ]] || PUBLIC_IP=''
 save_answer PUBLIC_IP
@@ -338,6 +339,7 @@ if ! confirm "Save these changes (stopping $NAME first if it is running)?"; then
 fi
 write_env STOP_APPROVED yes
 backend apply --answers "$ENV_FILE"
+START_REQUESTED=no
 if confirm 'Start the configured node now?'; then
   if [[ $KEY_MODE == import ]]; then
     confirm 'Have you stopped the original node using these keys?' || {
@@ -346,10 +348,17 @@ if confirm 'Start the configured node now?'; then
     }
   fi
   ensure_image
+  START_REQUESTED=yes
   if [[ $L2_MODE == local ]]; then
-    python3 "$ROOT/configure_l2_proxy.py"
+    if ! python3 "$ROOT/configure_l2_proxy.py"; then
+      warn 'Proxy setup/startup did not finish successfully. Check the container logs.'
+      SKIPPED+=('Verify local proxy setup and node health')
+    fi
   else
-    docker compose up -d --no-build --wait --wait-timeout 180 "$NAME"
+    if ! docker compose up -d --no-build --wait --wait-timeout 180 "$NAME"; then
+      warn 'Startup health checks did not pass. Firewall setup can still proceed if the node is running.'
+      SKIPPED+=('Verify node startup and health')
+    fi
   fi
 else
   if [[ $L2_MODE == local ]]; then
@@ -358,6 +367,44 @@ else
     note "Start later: docker compose up -d --no-build $NAME"
   fi
 fi
+
+stage 'Node firewall access'
+say 'Allow the selected node public TCP/UDP access and its public-address self-check.'
+say 'The helper discovers the running node address and ports, previews UFW rules, and backs up changes.'
+say 'It updates only rules it manages; SSH, other applications, and proxy exposure are preserved.'
+say 'UFW must already be active. Other host/provider firewalls require manual configuration.'
+FIREWALL_HELPER="$ROOT/scripts/node_firewall.py"
+if [[ $START_REQUESTED == yes ]] && confirm 'Review UFW rules for this node (requires root/sudo)?'; then
+  FIREWALL_COMMAND=(python3 "$FIREWALL_HELPER" --service "$NAME")
+  # Check the caller's Docker context before sudo can switch to root's context.
+  if ! python3 "$FIREWALL_HELPER" --service "$NAME" --check-host; then
+    SKIPPED+=('Configure firewall on the actual Docker host')
+  elif (( EUID != 0 )) && ! command -v sudo >/dev/null 2>&1; then
+    warn 'sudo is unavailable. Run the firewall helper as root on the Docker host.'
+    SKIPPED+=('Configure node firewall as root')
+  else
+    if (( EUID != 0 )); then FIREWALL_COMMAND=(sudo "${FIREWALL_COMMAND[@]}"); fi
+    if "${FIREWALL_COMMAND[@]}"; then
+      if confirm 'Apply the displayed UFW rule changes?'; then
+        if ! "${FIREWALL_COMMAND[@]}" --apply; then
+          warn 'Firewall setup failed. Node configuration was saved; inspect the reported error.'
+          SKIPPED+=('Resolve firewall setup failure')
+        fi
+      else
+        SKIPPED+=('Configure node firewall access')
+      fi
+    else
+      warn 'Automatic UFW setup is unavailable. Configure the published ports manually or resolve the reported error.'
+      SKIPPED+=('Configure node firewall access')
+    fi
+  fi
+else
+  SKIPPED+=('Configure node firewall access after startup')
+fi
+note "Preview or refresh later: sudo python3 scripts/node_firewall.py --service $NAME"
+note 'Add --apply to save the rules; use --interface INTERFACE to override the detected public interface.'
+note 'Rerun after Docker IP/bridge or port changes. Configure provider firewalls separately.'
+pause 'Press Enter for the setup summary.'
 # Answers are temporary; persistent values were saved by the validated backend.
 WRITTEN_ENV=()
 finish

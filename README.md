@@ -83,6 +83,35 @@ Nodes configured as `direct` or external `proxy` opt out of automatic local
 rewiring using `L2_AUTO_PROXY=0`. When changing a formerly local node to direct or
 external access, rerun `configure_l2_proxy.py` to refresh the proxy's allowlist.
 
+After startup, the wizard offers to configure **UFW firewall access** for the
+selected node. It detects the live Docker IPv4, bridge, advertised public IPv4,
+and configured ports (including offsets and stagenet). It previews the rules,
+asks before applying them with root/sudo, and backs up `/etc/ufw` under
+`/var/lib/session-node-firewall/backup-*`. UFW must already be active; the wizard
+does not install or enable it. Docker must use the local rootful Unix socket.
+
+The helper adds public-interface forwarding rules for the node's TCP/UDP ports,
+including hosts using UFW's `DOCKER-USER` integration. It also permits the node
+to connect back to its advertised public Quorumnet port. It preserves SSH,
+unrelated rules, equivalent manual rules, and the proxy's firewall restrictions.
+Matching deny rules require manual review. Provider firewalls and upstream NAT
+must be configured separately; applying UFW rules is not a public reachability
+test.
+
+If you save without starting, skip firewall setup, or later change the node's
+ports, Docker IP/bridge, or public interface, preview and refresh the rules with:
+
+```bash
+sudo python3 scripts/node_firewall.py --service oxen00
+sudo python3 scripts/node_firewall.py --service oxen00 --apply
+```
+
+The default public interface comes from the IPv4 route to `1.1.1.1`; use
+`--interface enp3s0` (your actual public interface) on hosts with VPN/policy
+routing. Refresh replaces obsolete rules created by this helper for that node.
+Rule updates are idempotent and attempt rollback on failure. This is a setup
+step, not continuous monitoring of Docker address changes.
+
 ## Build and run
 
 ```bash

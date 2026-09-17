@@ -1,0 +1,10 @@
+FROM ubuntu:24.04
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 ufw iproute2 && \
+    rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw && \
+    truncate -s 0 /etc/ufw/sysctl.conf && \
+    touch /firewall-test-container
+ENV FIREWALL_INTEGRATION=1
+WORKDIR /src
+CMD ["python3", "tests/test_firewall.py"]

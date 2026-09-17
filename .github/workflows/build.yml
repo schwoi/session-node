@@ -67,6 +67,12 @@ jobs:
           bash -n onboard-node.sh
           .onboarding-venv/bin/python tests/test_onboarding.py
 
+      - name: Test firewall onboarding in an isolated network namespace
+        run: |
+          docker build -t session-node:firewall-test - < tests/Dockerfile.firewall
+          docker run --rm --network none --cap-add NET_ADMIN \
+            -v "$PWD:/src:ro" session-node:firewall-test
+
       - name: Derive image version from installed Session Node
         id: version
         run: |
