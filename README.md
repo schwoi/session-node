@@ -275,6 +275,11 @@ opens for the selected row (arrow keys move the selection, Escape closes it).
 Each service has exactly one state, derived once in the backend:
 
 - **healthy**: running, every companion reported recently, chain within tolerance;
+- **syncing**: still doing its initial chain sync, shown as a percentage with the
+  blocks remaining. This is expected rather than a problem, so it does not count
+  as needing attention, and the incidental problems a syncing node produces
+  (failing health check, slow RPC, stale companion reports) are held back and
+  listed in the drawer until the chain catches up;
 - **degraded**: running, but a companion stopped reporting, the chain is behind,
   the health check fails, or oxend's RPC does not answer; the Status column
   says which;
