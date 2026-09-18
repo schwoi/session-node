@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session Node Manager</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Session Node Manager</h1>
+      <p class="muted" id="project">Connecting…</p>
+    </div>
+    <div class="toolbar">
+      <span class="muted" id="refreshed"></span>
+      <label class="check"><input type="checkbox" id="auto" checked> Auto-refresh</label>
+      <button id="refresh" class="button">Refresh</button>
+    </div>
+  </header>
+  <p id="message" class="message" hidden></p>
+  <main id="nodes"></main>
+
+  <template id="node-card">
+    <article class="card">
+      <div class="card-head">
+        <h2 class="name"></h2>
+        <span class="tags"></span>
+        <span class="pill state"></span>
+      </div>
+      <ul class="problems" hidden></ul>
+      <dl class="facts"></dl>
+      <div class="connections" hidden></div>
+      <div class="services"></div>
+      <div class="actions"></div>
+    </article>
+  </template>
+
+  <dialog id="dialog">
+    <form method="dialog" class="dialog-body">
+      <div class="dialog-head">
+        <h3 id="dialog-title"></h3>
+        <button class="button subtle" value="close">Close</button>
+      </div>
+      <div id="dialog-content"></div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

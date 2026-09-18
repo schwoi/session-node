@@ -96,7 +96,7 @@ docker compose logs --tail 100 -f oxen00
 
 Building locally uses the changes in this checkout. To use a published image instead, run `docker compose pull oxen00` before `docker compose up -d --no-build oxen00`. The registry image only acquires these changes after they are published.
 
-`oxen00` and `oxen01` are mainnet nodes. Proxy and stagenet services have optional profiles; explicitly naming a service starts it without enabling its profile. A bare `docker compose up -d` starts both mainnet nodes.
+`oxen00` and `oxen01` are mainnet nodes. Proxy, stagenet, and [manager](#management-dashboard) services have optional profiles; explicitly naming a service starts it without enabling its profile. A bare `docker compose up -d` starts both mainnet nodes.
 
 ```bash
 # Additional mainnet node, with separate data and ports
@@ -149,6 +149,11 @@ Keep `.env` private; it is ignored by Git. Environment values are visible to use
 | `STORAGE_HTTPS_PORT` | 22021 | Mainnet storage HTTPS port |
 | `LOKINET_PORT` | 1090 | Mainnet Lokinet UDP port |
 | `SESSION_ROUTER_PORT` | 1190 | Mainnet Session Router UDP port |
+| `MANAGER_TOKEN` | Empty | Bearer token required by the management dashboard and API when set |
+| `MANAGER_BIND` / `MANAGER_PORT` | `127.0.0.1` / `8080` | Host address and port publishing the dashboard |
+| `MANAGER_HOST` | `local` | Name of this server on a multi-server dashboard |
+| `MANAGER_PEERS` | Empty | `name=http://mesh-address:8080` entries for other servers' managers |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker Engine socket mounted into the manager |
 
 Compose also accepts `STAGENET_L2_PROVIDER` for its stagenet services and `SESSION_NODE_IMAGE` to override the image tag. It passes `L2_PROVIDER` from `.env` to both mainnet services and the proxy.
 
@@ -231,6 +236,92 @@ bash node_status.sh
 
 Follow the registration URL to stake. Before staking, verify full chain/L2 synchronization, externally reachable ports, and healthy storage/router reports. A successful container start alone does not prove network eligibility. The Docker health check verifies local RPC and recent pings from all required companions; it does not require chain synchronization. An unhealthy status needs investigation: Docker restart policies handle process exits, but do not automatically restart a container solely because its health check fails.
 
+## Management dashboard
+
+The optional `manager` service is a separate container that shows every node in
+this Compose project and lets you act on it from a browser or the JSON API:
+
+- container state, Docker health, uptime, image, and restart count;
+- oxend version, chain height versus sync target, and L2 tracker height;
+- each supervised process (`oxend`, `oxen-storage`, `lokinet`, `session-router`)
+  with the age of its last report to oxend;
+- inbound and outbound connections: oxend's P2P peer counts, plus established
+  TCP connections per service port (p2p, quorumnet, storage) read from the
+  container. Lokinet and Session Router relay over UDP and have no connections
+  to count;
+- node identity and staking state: unregistered, registered, awaiting stake,
+  or decommissioned;
+- container logs, `oxend status`, and `print_sn_status` output;
+- restart, stop, and start; and registration for staking.
+
+```bash
+docker compose up -d --no-build manager
+# then open http://127.0.0.1:8080
+```
+
+The dashboard image is `ghcr.io/schwoi/session-node-manager`; select a version with
+`SESSION_MANAGER_IMAGE` or build locally with `docker compose build manager`. The
+container uses only the Python standard library and runs read-only with all
+capabilities dropped.
+
+Registration runs `oxend register OPERATOR_ADDRESS` inside the selected node.
+**Preview** adds `print` and only displays the signed registration details.
+**Submit** sends them to the network's staking portal, exactly as the command-line
+registration does; the operator address must be the Arbitrum wallet that will
+stake. oxend refuses to register a node whose chain is not synchronized. Follow
+the printed portal link to complete staking. Adding a node service to this
+project remains an onboarding task (`./onboard-node.sh`); the dashboard manages
+containers that already exist.
+
+The manager needs the Docker Engine socket, and anything with that socket can
+control the whole host. The default publishes the dashboard on `127.0.0.1` only;
+reach it over SSH port forwarding. Without a token, the API only answers requests
+addressed to `localhost`, `127.0.0.1`, or `[::1]`, which also defeats DNS
+rebinding from a malicious web page. Before setting `MANAGER_BIND` to another
+address, set `MANAGER_TOKEN` in `.env` (the dashboard asks for it once per browser
+session; API clients send `Authorization: Bearer TOKEN`) and put TLS in front of
+it. Only containers of this Compose project are visible or controllable through
+the API, and state-changing requests require a custom request header that
+browsers cannot add cross-origin. On rootless Docker, set `DOCKER_SOCKET` to the
+user's daemon socket, typically `/run/user/UID/docker.sock`.
+
+### Several servers on one dashboard
+
+Each server keeps its own manager next to its nodes; one of them becomes the
+dashboard by listing the others as peers. Over a mesh such as Netbird:
+
+```dotenv
+# every server: reachable only on the mesh, same token everywhere
+MANAGER_BIND=100.64.0.2          # this server's mesh address
+MANAGER_TOKEN=the-shared-secret
+MANAGER_HOST=nodes-a             # name shown on the dashboard
+
+# the server you open in the browser
+MANAGER_PEERS=nodes-b=http://100.64.0.3:8080,proxy-1=http://100.64.0.7:8080
+```
+
+The hub fetches every peer's nodes in parallel, shows them grouped by host, and
+forwards restarts, logs, and registration to the right server using the shared
+token, under `/api/hosts/NAME/nodes/...`. An unreachable peer is shown as an error
+for that host; the others keep working. Peers may list peers of their own, but
+only their local nodes are relayed, so there are no loops. The mesh provides
+transport encryption; the token provides authorization, and `MANAGER_PEERS`
+refuses to start without one. Allow port 8080 on the mesh interface in the
+host firewall, for example `sudo ufw allow in on wt0 to any port 8080 proto tcp`.
+
+Node data is read through each container's loopback RPC, so a node's `oxend`
+must be running for anything beyond container status to appear; nodes that are
+defined but never started do not appear at all. The dashboard reflects local
+state and does not verify public reachability or reward eligibility.
+
+API: `GET /api/nodes` (local nodes plus a `peers` list), `GET /api/nodes/NAME`,
+`GET /api/nodes/NAME/logs?tail=200`, `GET /api/nodes/NAME/status`,
+`GET /api/nodes/NAME/print_sn_status`, and
+`POST /api/nodes/NAME/{restart,stop,start,register}` with
+`X-Requested-With: session-node-manager`. Registration takes a JSON body
+`{"operator_address": "0x…", "submit": false}`. Prefix a path with
+`/api/hosts/PEER` to address a peer's node through the hub.
+
 ## Updates and backups
 
 Back up **the actual private key files**. `oxen-sn-keys show` displays secret key material as well as the public key; keep its output private. Both networks use `/var/lib/oxen/key_ed25519` and `/var/lib/oxen/key_bls` in their separate volumes. The explicit `data-dir` preserves the original container's paths; native installations may use network subdirectories. Keep encrypted/offline backups with restricted access. A stopped-container backup of the entire bind-mounted data directory also preserves storage and router state. Never run two containers with the same node keys simultaneously.
@@ -253,6 +344,9 @@ docker build -t session-node:review .
 bash tests/container-smoke.sh session-node:review
 python3 tests/l2-setup-smoke.py session-node:review
 .onboarding-venv/bin/python tests/test_onboarding.py
+docker build -t session-node-manager:review manager
+python3 tests/test_manager.py
+python3 tests/manager-smoke.py session-node:review session-node-manager:review
 ```
 
-The smoke checks build configuration, package executables, invalid settings, process supervision and shutdown using isolated temporary containers. They do not register a node or prove public reachability, full synchronization, or successful uptime proofs.
+The smoke checks build configuration, package executables, invalid settings, process supervision and shutdown using isolated temporary containers. The manager tests cover its API against a fake Docker socket, then against real proxy and stagenet containers in a temporary Compose project. They do not register a node or prove public reachability, full synchronization, or successful uptime proofs.

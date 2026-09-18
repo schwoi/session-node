@@ -15,6 +15,8 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   # Increment for container changes that keep the same upstream node version.
   IMAGE_REVISION: "0"
+  # Management dashboard image; versioned independently of the node packages.
+  MANAGER_VERSION: "0.1.0"
 
 jobs:
   build:
@@ -41,8 +43,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build management image
+        run: docker build -t session-node-manager:local manager
+
+      - name: Test management API against a fake Docker socket
+        run: python3 tests/test_manager.py
+
       - name: Smoke test packaged services
         run: bash tests/container-smoke.sh session-node:local
+
+      - name: Smoke test management dashboard with real containers
+        run: python3 tests/manager-smoke.py session-node:local session-node-manager:local
 
       - name: Smoke test automatic L2 proxy setup
         run: python3 tests/l2-setup-smoke.py session-node:local
@@ -96,14 +107,29 @@ jobs:
             type=raw,value=${{ steps.version.outputs.node_version }},enable={{is_default_branch}}
             type=sha
 
-      # Publish the exact image inspected above, avoiding a second build that
+      - name: Generate management image tags
+        id: manager_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-manager
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.MANAGER_VERSION }},enable={{is_default_branch}}
+            type=sha
+
+      # Publish the exact images inspected above, avoiding a second build that
       # could select a different set of packages.
-      - name: Push tested image
+      - name: Push tested images
         if: github.event_name != 'pull_request'
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          MANAGER_TAGS: ${{ steps.manager_meta.outputs.tags }}
         run: |
           while IFS= read -r tag; do
             docker tag session-node:local "$tag"
             docker push "$tag"
           done <<< "$IMAGE_TAGS"
+          while IFS= read -r tag; do
+            docker tag session-node-manager:local "$tag"
+            docker push "$tag"
+          done <<< "$MANAGER_TAGS"
