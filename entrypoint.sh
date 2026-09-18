@@ -17,9 +17,11 @@ DATA_DIR=/var/lib/oxen
 # existing keys in place; Compose provides a separate volume for each network.
 NODE_DIR=$DATA_DIR
 if [[ $NETWORK == stagenet ]]; then
+  RPC_PORT=11023
   P2P_PORT=${P2P_PORT:-11022}
   QUORUMNET_PORT=${QUORUMNET_PORT:-11025}
 else
+  RPC_PORT=22023
   P2P_PORT=${P2P_PORT:-22022}
   QUORUMNET_PORT=${QUORUMNET_PORT:-22025}
 fi
@@ -71,7 +73,7 @@ cat > "$conf" <<CONFIG
 data-dir=$DATA_DIR
 log-file=$NODE_DIR/oxen.log
 p2p-bind-port=$P2P_PORT
-rpc-bind-ip=127.0.0.1
+rpc-admin=127.0.0.1:$RPC_PORT
 CONFIG
 [[ $NETWORK != stagenet ]] || echo 'stagenet=1' >> "$conf"
 if [[ $ROLE == node ]]; then
