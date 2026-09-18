@@ -236,9 +236,14 @@ def assess(summary, found=None):
     sync = summary.get('sync')
     if sync:
         # Initial sync is expected. Everything else it causes waits until the chain has caught up.
+        # A registered node catching up is still expected, but it risks decommission, so it keeps
+        # the operator's attention while showing the same progress.
         reason = f"syncing {sync['percent']}%" + (' · RPC busy' if sync.get('recalled') else '')
+        at_risk = bool(sync.get('registered'))
+        if at_risk:
+            reason += ' · registered node at risk'
         suppressed = [item for item in found if not item.endswith('blocks behind') or item.startswith('L2')]
-        return {'state': 'syncing', 'reason': reason, 'needs_attention': False, 'suppressed': suppressed}
+        return {'state': 'syncing', 'reason': reason, 'needs_attention': at_risk, 'suppressed': suppressed}
     if found:
         return {'state': 'degraded', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
     starting = summary['container']['health'] == 'starting'
@@ -409,8 +414,9 @@ class Manager:
         if node and node['rpc_ok']:
             progress = sync_progress(node['height'], node['target_height'])
             if progress:
-                self.sync_memory[container_id] = (node['height'], node['target_height'], time.monotonic())
-                return {'percent': progress[0], 'remaining': progress[1], 'recalled': False}
+                registered = bool((node.get('service_node') or {}).get('registered'))
+                self.sync_memory[container_id] = (node['height'], node['target_height'], time.monotonic(), registered)
+                return {'percent': progress[0], 'remaining': progress[1], 'recalled': False, 'registered': registered}
             self.sync_memory.pop(container_id, None)
             return None
         remembered = self.sync_memory.get(container_id)
@@ -418,7 +424,7 @@ class Manager:
             progress = sync_progress(remembered[0], remembered[1])
             if progress:
                 return {'percent': progress[0], 'remaining': progress[1], 'recalled': True,
-                        'age': int(time.monotonic() - remembered[2])}
+                        'registered': remembered[3], 'age': int(time.monotonic() - remembered[2])}
         return None
 
     def probe(self, container_id):

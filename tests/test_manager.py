@@ -224,7 +224,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(proxy['node']['pings'], {})
         # 120 blocks behind a 620 target is initial sync: expected, so nothing else is reported.
         self.assertEqual((proxy['state'], proxy['reason'], proxy['needs_attention']), ('syncing', 'syncing 80.6%', False))
-        self.assertEqual(proxy['sync'], {'percent': 80.6, 'remaining': 120, 'recalled': False})
+        self.assertEqual(proxy['sync'], {'percent': 80.6, 'remaining': 120, 'recalled': False, 'registered': False})
         self.assertEqual((proxy['problems'], proxy['suppressed']), ([], []))
         stagenet = nodes['stagenet00']
         self.assertIsNone(stagenet['node'])
@@ -392,6 +392,11 @@ class ManagerTests(unittest.TestCase):
         summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': True, 'age': 40}
         summary['node'] = None
         self.assertEqual(manager.assess(summary)['reason'], 'syncing 63.4% · RPC busy')
+        # A registered node catching up shows the same progress but stays in the attention list.
+        summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': False, 'registered': True}
+        risky = manager.assess(summary)
+        self.assertEqual((risky['state'], risky['reason'], risky['needs_attention']),
+                         ('syncing', 'syncing 63.4% · registered node at risk', True))
         self.assertIsNone(manager.sync_progress(2201600, 2201613))  # a few blocks behind is lag, not sync
         self.assertIsNone(manager.sync_progress(5, 0))
         self.assertEqual(manager.sync_progress(1000, 2000), (50.0, 1000))
@@ -399,16 +404,20 @@ class ManagerTests(unittest.TestCase):
     def test_sync_memory_covers_busy_rpc(self):
         mgr = self.server.manager
         running = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 1000, 'target_height': 2000}}
-        self.assertEqual(mgr.sync_state('c1', running), {'percent': 50.0, 'remaining': 1000, 'recalled': False})
+        self.assertEqual(mgr.sync_state('c1', running), {'percent': 50.0, 'remaining': 1000, 'recalled': False, 'registered': False})
         busy = {'container': {'state': 'running'}, 'node': None}
         recalled = mgr.sync_state('c1', busy)
-        self.assertEqual((recalled['percent'], recalled['recalled']), (50.0, True))
+        self.assertEqual((recalled['percent'], recalled['recalled'], recalled['registered']), (50.0, True, False))
+        registered = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 1000, 'target_height': 2000,
+                                                                    'service_node': {'registered': True}}}
+        self.assertTrue(mgr.sync_state('c2', registered)['registered'])
+        self.assertTrue(mgr.sync_state('c2', busy)['registered'])  # remembered along with the heights
         self.assertIsNone(mgr.sync_state('unknown', busy))
         synced = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 2000, 'target_height': 2000}}
         self.assertIsNone(mgr.sync_state('c1', synced))
         self.assertIsNone(mgr.sync_state('c1', busy))  # memory cleared once the node caught up
         mgr.sync_state('c1', running)
-        mgr.sync_memory['c1'] = (1000, 2000, manager.time.monotonic() - manager.SYNC_MEMORY - 1)
+        mgr.sync_memory['c1'] = (1000, 2000, manager.time.monotonic() - manager.SYNC_MEMORY - 1, False)
         self.assertIsNone(mgr.sync_state('c1', busy))  # too old to trust
         self.assertIsNone(mgr.sync_state('c1', {'container': {'state': 'exited'}, 'node': None}))
         self.assertNotIn('c1', mgr.sync_memory)
