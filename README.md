@@ -250,9 +250,12 @@ Each service has exactly one state, derived once in the backend:
   the health check fails, or oxend's RPC does not answer; the Status column
   says which;
 - **stopped**: the container is not running; shown in grey because a deliberate
-  stop is not an incident;
-- **unknown**: the host's manager is unreachable, shown red because not knowing
-  is worse than knowing.
+  stop is not an incident.
+
+A host whose manager cannot be reached is a different case: its services have no
+state at all, so the dashboard shows the host as a red, collapsed **unreachable**
+group with how long ago it last answered, rather than guessing that its nodes
+are down.
 
 Rows show uptime, height, P2P peers, one chip per supervised process
 (`oxend`, `oxen-storage`, `lokinet`, `session-router`) coloured by its own

@@ -65,7 +65,9 @@ function buildHosts(payload) {
       }
     }
   }
-  const fleetVersion = Object.keys(versions).sort((a, b) => versions[b] - versions[a])[0] || null;
+  // Drift is only meaningful against a clear majority version; with a tie nobody is "the odd one out".
+  const ranked = Object.keys(versions).sort((a, b) => versions[b] - versions[a] || a.localeCompare(b));
+  const fleetVersion = ranked.length && (ranked.length === 1 || versions[ranked[0]] > versions[ranked[1]]) ? ranked[0] : null;
   for (const host of hosts) {
     for (const service of host.services) service.versionDrift = Boolean(service.version && fleetVersion && service.version !== fleetVersion);
     host.attention = host.agent !== 'online' || host.services.some((service) => service.needsAttention);

@@ -154,7 +154,7 @@ body.drawer-open .thead .col-version { display: none; }
 .row .num { font-size: 12px; color: var(--text-2); }
 .row .peers { font-size: 12px; color: var(--text-3); }
 .row .version { font-size: 11px; color: var(--text-4); white-space: nowrap; text-overflow: ellipsis; }
-.row .procs { display: flex; align-items: center; gap: 4px; padding-right: 6px; flex-wrap: nowrap; }
+.row .procs { display: flex; align-items: center; gap: 3px; padding-right: 4px; flex-wrap: nowrap; }
 .row .procs .chip { flex-shrink: 1; min-width: 0; }
 .row .procs .chip span:last-child { overflow: hidden; text-overflow: ellipsis; }
 body.drawer-open .row .procs { gap: 4px; }
@@ -258,9 +258,10 @@ body.drawer-open .drawer { display: flex; }
 .pill--warn { color: var(--warn); border-color: var(--warn-line); background: var(--warn-bg); }
 .pill--bad { color: var(--bad); border-color: var(--bad-line); background: var(--bad-bg); }
 
+/* Sized so four named chips fit the 272px column even with a wide fallback mono font. */
 .chip {
   font-family: var(--font-mono); display: inline-flex; align-items: center; gap: 4px;
-  height: 19px; padding: 0 5px; border-radius: var(--r-sm); font-size: 10.5px; color: #b6b6bf;
+  height: 19px; padding: 0 4px; border-radius: var(--r-sm); font-size: 10px; color: #b6b6bf;
   background: var(--surface-3); border: 1px solid #272730; white-space: nowrap;
 }
 .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: currentColor; }

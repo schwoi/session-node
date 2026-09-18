@@ -229,7 +229,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(stagenet['problems'], ['stopped 6m ago'])
         self.assertEqual((stagenet['state'], stagenet['reason']), ('stopped', 'stopped 6m ago'))
         self.assertIsNone(stagenet['container']['uptime'])
-        self.assertTrue(360 <= stagenet['container']['stopped_ago'] <= 365)
+        self.assertTrue(360 <= stagenet['container']['stopped_ago'] <= 600)  # FINISHED is fixed at import time
         probes = [call for call in FakeDocker.calls if call[0] == 'exec']
         self.assertEqual(sorted(call[1] for call in probes), ['l2proxy', 'oxen00'])
 
