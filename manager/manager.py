@@ -232,7 +232,6 @@ def assess(summary, found=None):
     found = problems(summary) if found is None else found
     if summary['container']['state'] != 'running':
         return {'state': 'stopped', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
-    node = summary['node'] or {}
     sync = summary.get('sync')
     if sync:
         # Initial sync is expected. Everything else it causes waits until the chain has caught up.
@@ -416,15 +415,17 @@ class Manager:
             if progress:
                 registered = bool((node.get('service_node') or {}).get('registered'))
                 self.sync_memory[container_id] = (node['height'], node['target_height'], time.monotonic(), registered)
-                return {'percent': progress[0], 'remaining': progress[1], 'recalled': False, 'registered': registered}
+                return {'percent': progress[0], 'remaining': progress[1], 'height': node['height'],
+                        'target': node['target_height'], 'recalled': False, 'registered': registered}
             self.sync_memory.pop(container_id, None)
             return None
         remembered = self.sync_memory.get(container_id)
         if remembered and time.monotonic() - remembered[2] < SYNC_MEMORY:
             progress = sync_progress(remembered[0], remembered[1])
             if progress:
-                return {'percent': progress[0], 'remaining': progress[1], 'recalled': True,
-                        'registered': remembered[3], 'age': int(time.monotonic() - remembered[2])}
+                return {'percent': progress[0], 'remaining': progress[1], 'height': remembered[0],
+                        'target': remembered[1], 'recalled': True, 'registered': remembered[3],
+                        'age': int(time.monotonic() - remembered[2])}
         return None
 
     def probe(self, container_id):

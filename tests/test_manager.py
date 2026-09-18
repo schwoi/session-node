@@ -224,7 +224,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(proxy['node']['pings'], {})
         # 120 blocks behind a 620 target is initial sync: expected, so nothing else is reported.
         self.assertEqual((proxy['state'], proxy['reason'], proxy['needs_attention']), ('syncing', 'syncing 80.6%', False))
-        self.assertEqual(proxy['sync'], {'percent': 80.6, 'remaining': 120, 'recalled': False, 'registered': False})
+        self.assertEqual(proxy['sync'], {'percent': 80.6, 'remaining': 120, 'height': 500, 'target': 620, 'recalled': False, 'registered': False})
         self.assertEqual((proxy['problems'], proxy['suppressed']), ([], []))
         stagenet = nodes['stagenet00']
         self.assertIsNone(stagenet['node'])
@@ -404,7 +404,7 @@ class ManagerTests(unittest.TestCase):
     def test_sync_memory_covers_busy_rpc(self):
         mgr = self.server.manager
         running = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 1000, 'target_height': 2000}}
-        self.assertEqual(mgr.sync_state('c1', running), {'percent': 50.0, 'remaining': 1000, 'recalled': False, 'registered': False})
+        self.assertEqual(mgr.sync_state('c1', running), {'percent': 50.0, 'remaining': 1000, 'height': 1000, 'target': 2000, 'recalled': False, 'registered': False})
         busy = {'container': {'state': 'running'}, 'node': None}
         recalled = mgr.sync_state('c1', busy)
         self.assertEqual((recalled['percent'], recalled['recalled'], recalled['registered']), (50.0, True, False))

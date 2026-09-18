@@ -433,7 +433,10 @@ function renderRow(service, narrow) {
   row.append(element('span', 'm num', service.running ? duration(service.uptime) : '—'));
   const heightCell = element('span', `m num${service.state === 'syncing' ? ' is-sync' : service.lagging ? ' is-warn' : ''}`,
     service.state === 'syncing' ? `${service.sync.percent}%` : service.height == null ? '—' : String(service.height));
-  if (service.state === 'syncing') heightCell.title = `${service.height ?? '?'} of ${(service.height ?? 0) + service.sync.remaining}, ${service.sync.remaining} blocks to go`;
+  if (service.state === 'syncing') {
+    heightCell.title = `${service.sync.height} of ${service.sync.target}, ${service.sync.remaining} blocks to go`
+      + (service.sync.recalled ? ` (last reading ${duration(service.sync.age)} ago)` : '');
+  }
   row.append(heightCell);
   if (!narrow) row.append(element('span', 'm peers', service.peersIn == null ? '—' : `${service.peersIn} / ${service.peersOut ?? '—'}`));
 
