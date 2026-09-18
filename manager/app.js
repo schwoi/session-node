@@ -214,7 +214,9 @@ function icon(kind) {
 
 const pill = (text, tone) => element('span', `pill${tone ? ` pill--${tone}` : ''}`, text);
 const dot = (tone, extra = '') => element('span', `dot is-${tone}${extra ? ` ${extra}` : ''}`);
-const processTone = (process) => (!process.alive ? 'idle' : process.stale ? 'warn' : 'ok');
+// While a node is still syncing, companions that have not started reporting are expected, not amber.
+const processTone = (process, service) => (!process.alive ? 'idle'
+  : process.stale ? (service && service.state === 'syncing' && process.reported_ago == null ? 'idle' : 'warn') : 'ok');
 const shortName = (name) => (name || '').replace('oxen-', '').replace('session-', '');
 const shortVersion = (version) => (version || '—').replace('~ubuntu2404', '');
 
@@ -363,7 +365,10 @@ function renderGroup(host, rows, narrow) {
   const right = element('div', 'right');
   if (host.agent !== 'online') right.append(pill('unreachable', 'bad'));
   else if (host.attention) right.append(pill(`${host.attentionCount} need${host.attentionCount === 1 ? 's' : ''} attention`, 'warn'));
-  else right.append(pill(`${host.services.length} healthy`, 'ok'));
+  else if (host.services.some((service) => service.state === 'syncing')) {
+    const syncing = host.services.filter((service) => service.state === 'syncing').length;
+    right.append(pill(`${syncing} syncing · ${host.services.length - syncing} healthy`, 'sync'));
+  } else right.append(pill(`${host.services.length} healthy`, 'ok'));
   if (host.agent !== 'online') right.append(button('Retry', () => refresh()));
   else right.append(button('Host actions', (event) => openHostMenu(event.currentTarget, host), 'btn', `Actions for host ${host.name}`));
   head.append(left, right);
@@ -443,7 +448,7 @@ function renderRow(service, narrow) {
   const procs = element('div', 'procs');
   if (!service.processes.length) procs.append(element('span', 'muted', service.running ? 'starting' : '—'));
   for (const process of service.processes) {
-    const processTone_ = processTone(process);
+    const processTone_ = processTone(process, service);
     if (narrow) {
       const square = element('span', `sq is-${processTone_}`);
       square.title = `${process.name}${process.stale ? ' (stale)' : ''}`;
@@ -594,12 +599,12 @@ function renderDrawer() {
   const processes = element('div', 'kv');
   processes.style.gridTemplateColumns = '1fr auto';
   for (const process of service.processes) {
-    const tone = processTone(process);
+    const tone = processTone(process, service);
     const label = element('span', `proc${tone !== 'ok' ? ` is-${tone}` : ''}`);
     label.append(dot(tone, 'dot--sm'), element('span', null, process.name));
     const when = element('span', `m when${tone !== 'ok' ? ` is-${tone}` : ''}`,
       !process.alive ? 'not running' : process.reported_ago != null ? `reported ${duration(process.reported_ago)} ago`
-        : process.name in (service.raw.node?.pings || {}) ? 'never reported' : 'running');
+        : process.name in (service.raw.node?.pings || {}) ? (service.state === 'syncing' ? 'waiting for sync' : 'never reported') : 'running');
     processes.append(label, when);
   }
   if (!service.processes.length) processes.append(element('span', 'muted', service.running ? 'starting' : 'not running'));
