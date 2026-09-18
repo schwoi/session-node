@@ -828,7 +828,9 @@ function askToken() {
 /* Refresh ------------------------------------------------------------------ */
 
 async function refresh(force = false) {
+  // A slow host must not make auto-refresh stack requests; a manual refresh still wins.
   if (state.busy && !force) return;
+  state.busy = true;
   const generation = ++state.generation;
   try {
     const payload = await api('/api/nodes');
@@ -842,6 +844,7 @@ async function refresh(force = false) {
   } catch (error) {
     if (generation === state.generation) showMessage(error.message);
   } finally {
+    if (generation === state.generation) state.busy = false;
     state.countdown = REFRESH_SECONDS;
   }
 }

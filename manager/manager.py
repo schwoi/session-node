@@ -45,13 +45,19 @@ PROBE = r'''
 set -uo pipefail
 port=22023
 [[ ${NETWORK:-mainnet} != stagenet ]] || port=11023
-# A node under sync load can take well over five seconds to answer; allow fifteen.
+# A node under sync load can take well over five seconds to answer; allow fifteen,
+# and issue the three RPC calls at once so the probe never waits longer than that.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 rpc() { curl -fsS --max-time 15 -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\"}" "http://127.0.0.1:$port/json_rpc"; }
-info=$(curl -fsS --max-time 15 "http://127.0.0.1:$port/get_info") || info=null
-keys=$(rpc get_service_keys) || keys=null
-sn=null
-[[ ${ROLE:-node} != node ]] || sn=$(rpc get_service_node_status) || sn=null
+curl -fsS --max-time 15 "http://127.0.0.1:$port/get_info" > "$tmp/info" 2>/dev/null &
+rpc get_service_keys > "$tmp/keys" 2>/dev/null &
+[[ ${ROLE:-node} != node ]] || rpc get_service_node_status > "$tmp/sn" 2>/dev/null &
+wait
+info=$(jq -c . "$tmp/info" 2>/dev/null) || info=null
+keys=$(jq -c . "$tmp/keys" 2>/dev/null) || keys=null
+sn=$(jq -c . "$tmp/sn" 2>/dev/null) || sn=null
 procs='[]'
 if [[ -s /run/session-node.pids ]]; then
   procs=$(while IFS= read -r pid; do

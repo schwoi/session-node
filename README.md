@@ -249,8 +249,9 @@ Each service has exactly one state, derived once in the backend:
 - **degraded**: running, but a companion stopped reporting, the chain is behind,
   the health check fails, or oxend's RPC does not answer; the Status column
   says which;
-- **stopped**: the container is not running; shown in grey because a deliberate
-  stop is not an incident.
+- **stopped**: the container is not running. It counts as needing attention
+  and appears in that filter, but it is shown in grey rather than red because
+  a deliberate stop is not an incident.
 
 A host whose manager cannot be reached is a different case: its services have no
 state at all, so the dashboard shows the host as a red, collapsed **unreachable**
