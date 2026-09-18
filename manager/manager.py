@@ -106,8 +106,12 @@ if [[ -r /var/lib/oxen/oxen.log ]]; then
     synclog=$(jq -cn --argjson h "$h" --argjson t "$t" --argjson age "$(( $(date +%s) - at ))" '{height:$h,target:$t,age:$age}')
   fi
 fi
+# A malformed piece must degrade to null, never fail the whole reading.
+json_or() { if jq -e . >/dev/null 2>&1 <<< "$1"; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+info=$(json_or "$info" null); keys=$(json_or "$keys" null); sn=$(json_or "$sn" null)
+procs=$(json_or "$procs" '[]'); conns=$(json_or "$conns" '[]'); synclog=$(json_or "$synclog" null)
 jq -cn --argjson info "$info" --argjson keys "$keys" --argjson sn "$sn" --argjson procs "$procs" \
-  --argjson conns "${conns:-[]}" --argjson synclog "$synclog" --argjson now "$(date +%s)" \
+  --argjson conns "$conns" --argjson synclog "$synclog" --argjson now "$(date +%s)" \
   '{info:$info,keys:$keys,sn:$sn,processes:$procs,connections:$conns,synclog:$synclog,now:$now}'
 '''
 
@@ -254,7 +258,9 @@ def assess(summary, found=None):
         at_risk = bool(sync.get('registered'))
         if at_risk:
             reason += ' · registered node at risk'
-        suppressed = [item for item in found if not item.endswith('blocks behind') or item.startswith('L2')]
+        # The block deficit is the sync itself, and a busy RPC is already stated in the reason.
+        suppressed = [item for item in found if (not item.endswith('blocks behind') or item.startswith('L2'))
+                      and not (sync.get('recalled') and item == 'oxend RPC unreachable')]
         return {'state': 'syncing', 'reason': reason, 'needs_attention': at_risk, 'suppressed': suppressed}
     if found:
         return {'state': 'degraded', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
@@ -441,7 +447,10 @@ class Manager:
                 self.sync_memory[container_id] = (synclog['height'], synclog['target'], time.monotonic(), registered)
                 return {'percent': progress[0], 'remaining': progress[1], 'height': synclog['height'],
                         'target': synclog['target'], 'recalled': True, 'registered': registered, 'age': synclog['age']}
-        if remembered and time.monotonic() - remembered[2] < SYNC_MEMORY:
+        if remembered and time.monotonic() - remembered[2] >= SYNC_MEMORY:
+            self.sync_memory.pop(container_id, None)  # too old to trust; forget it
+            remembered = None
+        if remembered:
             progress = sync_progress(remembered[0], remembered[1])
             if progress:
                 return {'percent': progress[0], 'remaining': progress[1], 'height': remembered[0],

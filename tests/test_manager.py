@@ -391,7 +391,9 @@ class ManagerTests(unittest.TestCase):
             'suppressed': ['health check failing', 'lokinet never reported', 'L2 tracker 4 blocks behind']})
         summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': True, 'age': 40}
         summary['node'] = None
-        self.assertEqual(manager.assess(summary)['reason'], 'syncing 63.4% · RPC busy')
+        recalled = manager.assess(summary)
+        self.assertEqual(recalled['reason'], 'syncing 63.4% · RPC busy')
+        self.assertNotIn('oxend RPC unreachable', recalled['suppressed'])  # already said by "RPC busy"
         # A registered node catching up shows the same progress but stays in the attention list.
         summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': False, 'registered': True}
         risky = manager.assess(summary)
@@ -425,6 +427,7 @@ class ManagerTests(unittest.TestCase):
         mgr.sync_state('c1', running)
         mgr.sync_memory['c1'] = (1000, 2000, manager.time.monotonic() - manager.SYNC_MEMORY - 1, False)
         self.assertIsNone(mgr.sync_state('c1', busy))  # too old to trust
+        self.assertNotIn('c1', mgr.sync_memory)  # and forgotten, not kept forever
         self.assertIsNone(mgr.sync_state('c1', {'container': {'state': 'exited'}, 'node': None}))
         self.assertNotIn('c1', mgr.sync_memory)
 
