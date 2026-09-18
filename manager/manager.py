@@ -45,9 +45,10 @@ PROBE = r'''
 set -uo pipefail
 port=22023
 [[ ${NETWORK:-mainnet} != stagenet ]] || port=11023
-rpc() { curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+# A node under sync load can take well over five seconds to answer; allow fifteen.
+rpc() { curl -fsS --max-time 15 -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\"}" "http://127.0.0.1:$port/json_rpc"; }
-info=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/get_info") || info=null
+info=$(curl -fsS --max-time 15 "http://127.0.0.1:$port/get_info") || info=null
 keys=$(rpc get_service_keys) || keys=null
 sn=null
 [[ ${ROLE:-node} != node ]] || sn=$(rpc get_service_node_status) || sn=null
@@ -371,7 +372,7 @@ class Manager:
 
     def probe(self, container_id):
         try:
-            code, stdout, output = self.docker.exec(container_id, ['bash', '-c', PROBE])
+            code, stdout, output = self.docker.exec(container_id, ['bash', '-c', PROBE], timeout=75)
             if code == 0:
                 return json.loads(stdout)
             reason = f'exit code {code}: {output.strip()[-300:]}'
