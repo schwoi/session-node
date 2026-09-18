@@ -1,4 +1,36 @@
 services:
+  # ── Management dashboard ───────────────────────────────────────
+  # Health, services, logs, restarts, and staking registration for the
+  # node containers in this Compose project. Requires the Docker socket,
+  # which grants host-level control: keep it on localhost or set MANAGER_TOKEN.
+  #   docker compose up -d --no-build manager
+  manager:
+    profiles: [manager]
+    image: ${SESSION_MANAGER_IMAGE:-ghcr.io/schwoi/session-node-manager:latest}
+    build: ./manager
+    ports:
+      - "${MANAGER_BIND:-127.0.0.1}:${MANAGER_PORT:-8080}:8080/tcp"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    environment:
+      # Not a node; excluded from onboarding and automatic L2 proxy discovery.
+      - ROLE=manager
+      - MANAGER_TOKEN=${MANAGER_TOKEN:-}
+      # Multi-server dashboard: name shown for this host, and peer managers to include.
+      - MANAGER_HOST=${MANAGER_HOST:-local}
+      - MANAGER_PEERS=${MANAGER_PEERS:-}
+
   # ── L2 Proxy ───────────────────────────────────────────────────
   # Runs oxend as an L2 proxy that forwards Arbitrum data to service nodes.
   # Automatic local key discovery and reciprocal configuration:
