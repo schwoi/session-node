@@ -252,7 +252,6 @@ Each service has exactly one state, derived once in the backend:
 - **stopped**: the container is not running. It still counts as needing
   attention, but it is shown in grey rather than red because a deliberate stop
   is not an outage;
-  a deliberate stop is not an incident.
 
 A host whose manager cannot be reached is a different case: its services have no
 state at all, so the dashboard shows the host as a red, collapsed **unreachable**
