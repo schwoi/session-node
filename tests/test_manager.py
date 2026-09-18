@@ -11,6 +11,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 REPO = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('manager', REPO / 'manager/manager.py')
@@ -44,6 +45,9 @@ CONTAINERS = {
     'manager': ('running', 'healthy', ['ROLE=manager']),
     'peer': ('running', 'healthy', ['ROLE=manager', 'MANAGER_HOST=other']),
 }
+
+
+FINISHED = (datetime.now(timezone.utc) - timedelta(seconds=360)).strftime('%Y-%m-%dT%H:%M:%S.000000000Z')
 
 
 def frames(*chunks):
@@ -91,7 +95,8 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
             details = {'Id': parts[1], 'RestartCount': 2 if name == 'oxen00' else 0,
                        'Config': {'Env': env, 'Image': 'ghcr.io/schwoi/session-node:11.6.1.0'},
                        'State': {'Status': state, 'Running': state == 'running',
-                                 'StartedAt': '2026-09-17T10:00:00.123456789Z'}}
+                                 'StartedAt': '2026-09-17T10:00:00.123456789Z',
+                                 'FinishedAt': FINISHED}}
             if health:
                 details['State']['Health'] = {'Status': health}
             return self.reply(200, details)
@@ -199,8 +204,14 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(oxen['node']['pubkey'], 'ab' * 32)
         self.assertEqual(oxen['node']['pings'], {'oxen-storage': 20, 'lokinet': 900, 'session-router': 30})
         self.assertTrue(oxen['node']['service_node']['registered'])
-        self.assertEqual([p['name'] for p in oxen['processes']], ['oxend', 'oxen-storage', 'lokinet', 'session-router'])
-        self.assertEqual(oxen['problems'], ['session-router is not running', 'lokinet last reported 15 minutes ago'])
+        self.assertEqual([(p['name'], p['stale'], p['reported_ago']) for p in oxen['processes']],
+                         [('oxend', False, None), ('oxen-storage', False, 20), ('lokinet', True, 900), ('session-router', True, 30)])
+        self.assertEqual(oxen['node']['behind'], 0)
+        self.assertEqual((nodes['l2proxy']['node']['behind'], nodes['l2proxy']['node']['lagging']), (120, True))
+        self.assertFalse(oxen['node']['lagging'])
+        self.assertEqual(oxen['problems'], ['session-router not running', 'lokinet not reporting (15m)'])
+        self.assertEqual((oxen['state'], oxen['reason'], oxen['needs_attention']),
+                         ('degraded', 'session-router not running', True))
         self.assertEqual(oxen['node']['peers'], {'inbound': 3, 'outbound': 8})
         self.assertEqual(oxen['connections'], {'inbound': 10, 'outbound': 9, 'services': {
             'p2p': {'inbound': 3, 'outbound': 8}, 'quorumnet': {'inbound': 2, 'outbound': 0},
@@ -211,11 +222,14 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(proxy['container']['health'], 'starting')
         self.assertIsNone(proxy['node']['service_node'])
         self.assertEqual(proxy['node']['pings'], {})
-        self.assertEqual(proxy['problems'], ['Docker health check: starting', 'Blockchain is 120 blocks behind'])
+        self.assertEqual(proxy['problems'], ['120 blocks behind'])
+        self.assertEqual(proxy['state'], 'degraded')
         stagenet = nodes['stagenet00']
         self.assertIsNone(stagenet['node'])
-        self.assertEqual(stagenet['problems'], ['Container is exited'])
-        self.assertEqual(stagenet['container']['uptime'], None)
+        self.assertEqual(stagenet['problems'], ['stopped 6m ago'])
+        self.assertEqual((stagenet['state'], stagenet['reason']), ('stopped', 'stopped 6m ago'))
+        self.assertIsNone(stagenet['container']['uptime'])
+        self.assertTrue(360 <= stagenet['container']['stopped_ago'] <= 365)
         probes = [call for call in FakeDocker.calls if call[0] == 'exec']
         self.assertEqual(sorted(call[1] for call in probes), ['l2proxy', 'oxen00'])
 
@@ -329,6 +343,11 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual([node['name'] for node in remote['nodes']], ['l2proxy', 'oxen00', 'stagenet00'])
         self.assertEqual((down['host'], down['nodes']), ('down', []))
         self.assertIn('127.0.0.1:9', down['error'])
+        self.assertIsNone(down['last_seen_ago'])
+        # A peer that answered once reports how long ago that was when it later fails.
+        self.server.manager.peer_seen['down'] = manager.time.monotonic() - 120
+        _, payload = self.request('/api/nodes', headers=auth)
+        self.assertTrue(120 <= payload['peers'][1]['last_seen_ago'] <= 125)
         status, payload = self.request('/api/hosts/remote/nodes/oxen00', headers=auth)
         self.assertEqual((status, payload['name'], payload['node']['pubkey']), (200, 'oxen00', 'ab' * 32))
         status, text = self.request('/api/hosts/remote/nodes/oxen00/logs?tail=5', headers=auth)
@@ -382,10 +401,18 @@ class ManagerTests(unittest.TestCase):
         summary = {'role': 'node', 'container': {'state': 'running', 'health': 'unhealthy'},
                    'node': node, 'processes': []}
         self.assertEqual(manager.problems(summary), [
-            'Docker health check: unhealthy', 'oxen-storage has never reported to oxend',
-            'lokinet has never reported to oxend', 'session-router has never reported to oxend'])
+            'health check failing', 'oxen-storage never reported', 'lokinet never reported',
+            'session-router never reported'])
         summary['node'] = None
-        self.assertEqual(manager.problems(summary), ['Docker health check: unhealthy', 'oxend RPC is unreachable'])
+        self.assertEqual(manager.problems(summary), ['health check failing', 'oxend RPC unreachable'])
+        self.assertEqual(manager.assess(summary), {'state': 'degraded', 'reason': 'health check failing', 'needs_attention': True})
+        summary['container'] = {'state': 'running', 'health': 'starting'}
+        summary['node'] = {'rpc_ok': True, 'pings': {}, 'behind': 0, 'lagging': False,
+                           'l2_tracker_height': None, 'l2_height': None, 'service_node': None}
+        self.assertEqual(manager.assess(summary), {'state': 'healthy', 'reason': 'starting', 'needs_attention': False})
+        summary['container'] = {'state': 'exited', 'health': None, 'stopped_ago': 4000}
+        self.assertEqual(manager.assess(summary), {'state': 'stopped', 'reason': 'stopped 1h 6m ago', 'needs_attention': True})
+        self.assertEqual([manager.ago(s) for s in (5, 61, 3660, 90000)], ['5s', '1m', '1h 1m', '1d 1h'])
         ports = manager.service_ports({'P2P_PORT': '11032', 'QUORUMNET_PORT': 'bad'}, 'stagenet')
         self.assertEqual(ports, {11032: 'p2p', 22020: 'storage', 22021: 'storage https'})
         self.assertEqual(manager.service_ports({}, 'mainnet'), {22022: 'p2p', 22025: 'quorumnet', 22020: 'storage', 22021: 'storage https'})

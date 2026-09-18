@@ -4,48 +4,99 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Session Node Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <header>
-    <div>
+<div class="app">
+  <header class="appbar">
+    <div class="cluster">
       <h1>Session Node Manager</h1>
-      <p class="muted" id="project">Connecting…</p>
+      <span class="m muted" id="fleet-count"></span>
     </div>
-    <div class="toolbar">
-      <span class="muted" id="refreshed"></span>
-      <label class="check"><input type="checkbox" id="auto" checked> Auto-refresh</label>
-      <button id="refresh" class="button">Refresh</button>
+    <div class="cluster cluster--wide">
+      <span class="m muted" id="updated"></span>
+      <label class="field field--check"><input type="checkbox" id="autorefresh" checked> Auto-refresh</label>
+      <button type="button" class="btn" id="refresh">Refresh</button>
     </div>
   </header>
+
+  <div class="statusbar">
+    <div class="metrics" id="statusmetrics"></div>
+    <button type="button" class="btn" id="incidents">View incidents</button>
+  </div>
+
   <p id="message" class="message" hidden></p>
-  <main id="nodes"></main>
 
-  <template id="node-card">
-    <article class="card">
-      <div class="card-head">
-        <h2 class="name"></h2>
-        <span class="tags"></span>
-        <span class="pill state"></span>
+  <div class="toolbar">
+    <div class="seg" id="filters" role="group" aria-label="Filter services">
+      <button type="button" data-filter="attention" aria-pressed="true">Needs attention <span class="count"></span></button>
+      <button type="button" data-filter="all" aria-pressed="false">All <span class="count"></span></button>
+      <button type="button" data-filter="mainnet" aria-pressed="false">Mainnet <span class="count"></span></button>
+      <button type="button" data-filter="stagenet" aria-pressed="false">Stagenet <span class="count"></span></button>
+      <button type="button" data-filter="unregistered" aria-pressed="false">Unregistered <span class="count"></span></button>
+    </div>
+    <div class="cluster">
+      <div class="bulkbar" id="bulkbar">
+        <span id="bulkcount"></span>
+        <button type="button" id="bulk-restart">Restart</button>
+        <button type="button" id="bulk-stop">Stop</button>
+        <button type="button" id="bulkclear" class="subtle">Clear</button>
       </div>
-      <ul class="problems" hidden></ul>
-      <dl class="facts"></dl>
-      <div class="connections" hidden></div>
-      <div class="services"></div>
-      <div class="actions"></div>
-    </article>
-  </template>
+      <label class="field">Filter
+        <input type="search" id="search" placeholder="service, host, identity" autocomplete="off">
+      </label>
+      <label class="field">Sort
+        <select id="sort">
+          <option value="problems">Problems first</option>
+          <option value="host">Host name</option>
+          <option value="uptime">Uptime</option>
+        </select>
+      </label>
+    </div>
+  </div>
 
-  <dialog id="dialog">
-    <form method="dialog" class="dialog-body">
-      <div class="dialog-head">
-        <h3 id="dialog-title"></h3>
-        <button class="button subtle" value="close">Close</button>
+  <div class="body">
+    <div class="tablewrap">
+      <div class="thead" role="row">
+        <input type="checkbox" aria-label="Select all visible services" id="selectall">
+        <span class="lbl">Service</span>
+        <span class="lbl">Network</span>
+        <span class="lbl">Status</span>
+        <span class="lbl">Uptime</span>
+        <span class="lbl">Height</span>
+        <span class="lbl col-peers">Peers</span>
+        <span class="lbl">Processes</span>
+        <span class="lbl col-version">Version</span>
+        <span class="lbl lbl--right">Actions</span>
       </div>
-      <div id="dialog-content"></div>
-    </form>
-  </dialog>
+      <div class="tbody" id="tbody"></div>
+    </div>
+    <aside class="drawer" id="drawer" aria-label="Service details"></aside>
+  </div>
 
-  <script src="/app.js"></script>
+  <footer class="footer">
+    <div class="legend" id="legend"></div>
+    <span class="m" id="countdown"></span>
+  </footer>
+</div>
+
+<div class="menu" id="menu" hidden></div>
+
+<dialog id="dialog">
+  <form method="dialog" class="dialog-body">
+    <div class="dialog-head">
+      <h3 id="dialog-title"></h3>
+      <button class="btn btn--icon" value="close" aria-label="Close">
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 2.5 L9.5 9.5 M9.5 2.5 L2.5 9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div id="dialog-content"></div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
 </body>
 </html>

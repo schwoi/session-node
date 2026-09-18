@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
 
         status, result = api(base, '/api/nodes/stagenet00/stop', {})
         assert status == 200 and result['container']['state'] == 'exited', result
-        assert result['problems'] == ['Container is exited'] and result['node'] is None, result
+        assert result['state'] == 'stopped' and result['reason'].startswith('stopped ') and result['node'] is None, result
         assert api(base, '/api/nodes/stagenet00/register', {'operator_address': address})[0] == 400
         status, result = api(base, '/api/hosts/second/nodes/stagenet00/start', {})
         assert status == 200 and result['container']['state'] == 'running', result
