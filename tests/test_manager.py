@@ -413,6 +413,12 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(mgr.sync_state('c2', registered)['registered'])
         self.assertTrue(mgr.sync_state('c2', busy)['registered'])  # remembered along with the heights
         self.assertIsNone(mgr.sync_state('unknown', busy))
+        # With no memory yet, a fresh "Synced H/T" line from oxend's log is enough.
+        logged = mgr.sync_state('c3', busy, {'height': 400, 'target': 2000, 'age': 12})
+        self.assertEqual((logged['percent'], logged['remaining'], logged['recalled'], logged['age']), (20.0, 1600, True, 12))
+        self.assertIsNone(mgr.sync_state('c4', busy, {'height': 400, 'target': 2000, 'age': 5000}))  # stale line
+        self.assertIsNone(mgr.sync_state('c4', busy, {'height': 1990, 'target': 2000, 'age': 3}))  # caught up
+        self.assertEqual(mgr.sync_state('c3', busy)['percent'], 20.0)  # the log reading is remembered too
         synced = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 2000, 'target_height': 2000}}
         self.assertIsNone(mgr.sync_state('c1', synced))
         self.assertIsNone(mgr.sync_state('c1', busy))  # memory cleared once the node caught up

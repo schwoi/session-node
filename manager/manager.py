@@ -40,6 +40,8 @@ BEHIND_WARN = 2
 SYNC_BEHIND = 100
 # How long a remembered sync snapshot may stand in for a node whose RPC is busy.
 SYNC_MEMORY = 3600
+# How recent oxend's own "Synced H/T" log line must be to count as current progress.
+SYNC_LOG_FRESH = 600
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
 PINGS = (('oxen-storage', 'last_storage_server_ping'), ('lokinet', 'last_lokinet_ping'),
          ('session-router', 'last_session_router_ping'))
@@ -93,9 +95,20 @@ conns=$(
   done | sort | uniq -c | jq -cRn '[inputs | capture("^ *(?<n>[0-9]+) (?<d>in|out) (?<p>[0-9]+)$")
     | {direction:.d, port:(.p|tonumber), count:(.n|tonumber)}]'
 )
+# oxend logs "Synced H/T" every few seconds during initial sync even when its RPC is
+# too busy to answer, so the newest such line is the reliable progress signal.
+synclog=null
+if [[ -r /var/lib/oxen/oxen.log ]]; then
+  line=$(tail -n 5000 /var/lib/oxen/oxen.log | sed -nE 's/^\[([0-9-]+ [0-9:]+)\].*Synced ([0-9]+)\/([0-9]+).*/\1|\2|\3/p' | tail -n 1)
+  if [[ -n $line ]]; then
+    IFS='|' read -r stamp h t <<< "$line"
+    at=$(date -u -d "$stamp" +%s 2>/dev/null || echo 0)
+    synclog=$(jq -cn --argjson h "$h" --argjson t "$t" --argjson age "$(( $(date +%s) - at ))" '{height:$h,target:$t,age:$age}')
+  fi
+fi
 jq -cn --argjson info "$info" --argjson keys "$keys" --argjson sn "$sn" --argjson procs "$procs" \
-  --argjson conns "${conns:-[]}" --argjson now "$(date +%s)" \
-  '{info:$info,keys:$keys,sn:$sn,processes:$procs,connections:$conns,now:$now}'
+  --argjson conns "${conns:-[]}" --argjson synclog "$synclog" --argjson now "$(date +%s)" \
+  '{info:$info,keys:$keys,sn:$sn,processes:$procs,connections:$conns,synclog:$synclog,now:$now}'
 '''
 
 
@@ -383,6 +396,7 @@ class Manager:
                 'stopped_ago': int((now - finished).total_seconds()) if finished else None,
                 'restart_count': details.get('RestartCount', 0), 'image': details['Config'].get('Image')},
             'node': None, 'processes': [], 'connections': None, 'problems': []}
+        probe = None
         if state.get('Running') and summary['role'] in ('node', 'proxy'):
             probe = self.probe(container_id)
             if probe:
@@ -397,15 +411,15 @@ class Manager:
                     stale = name in pings and (age is None or age > PING_STALE)
                     summary['processes'].append({**process, 'name': name, 'reported_ago': age,
                                                  'stale': stale or not process.get('alive', True)})
-        summary['sync'] = self.sync_state(container_id, summary)
+        summary['sync'] = self.sync_state(container_id, summary, (probe or {}).get('synclog'))
         summary['problems'] = problems(summary)
         summary.update(assess(summary, summary['problems']))
         if summary['state'] == 'syncing':
             summary['problems'] = []
         return summary
 
-    def sync_state(self, container_id, summary):
-        """Initial-sync progress, remembered across probes so a busy RPC does not hide it."""
+    def sync_state(self, container_id, summary, synclog=None):
+        """Initial-sync progress from RPC, else from oxend's own log, else remembered from earlier."""
         node = summary['node']
         if not summary['container']['state'] == 'running':
             self.sync_memory.pop(container_id, None)
@@ -420,6 +434,13 @@ class Manager:
             self.sync_memory.pop(container_id, None)
             return None
         remembered = self.sync_memory.get(container_id)
+        if synclog and isinstance(synclog.get('age'), int) and 0 <= synclog['age'] < SYNC_LOG_FRESH:
+            progress = sync_progress(synclog.get('height'), synclog.get('target'))
+            if progress:
+                registered = bool(remembered and remembered[3])
+                self.sync_memory[container_id] = (synclog['height'], synclog['target'], time.monotonic(), registered)
+                return {'percent': progress[0], 'remaining': progress[1], 'height': synclog['height'],
+                        'target': synclog['target'], 'recalled': True, 'registered': registered, 'age': synclog['age']}
         if remembered and time.monotonic() - remembered[2] < SYNC_MEMORY:
             progress = sync_progress(remembered[0], remembered[1])
             if progress:
