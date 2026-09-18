@@ -25,6 +25,9 @@
   --warn: #f0b429;
   --bad: #f87171;
   --idle: #8a8a94;
+  --sync: #60a5fa;
+  --sync-bg: rgba(96, 165, 250, .10);
+  --sync-line: rgba(96, 165, 250, .35);
   --ok-bg: rgba(74, 222, 128, .10);
   --ok-line: rgba(74, 222, 128, .35);
   --warn-bg: rgba(240, 180, 41, .08);
@@ -164,6 +167,10 @@ body.drawer-open .row .procs { gap: 4px; }
 .is-warn { color: var(--warn); }
 .is-bad { color: var(--bad); }
 .is-idle { color: var(--idle); }
+.is-sync { color: var(--sync); }
+.pill--sync { color: var(--sync); border-color: var(--sync-line); background: var(--sync-bg); }
+.alert.is-sync { background: var(--sync-bg); border-color: var(--sync-line); color: var(--sync); }
+.suppressed { margin: 0; font-size: 11.5px; color: var(--text-4); }
 
 .empty {
   margin: 24px auto; max-width: 420px; text-align: center; display: flex; flex-direction: column; gap: 8px; align-items: center;

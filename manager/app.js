@@ -5,8 +5,8 @@
    (version drift, height tip) that need every host at once. */
 
 const REFRESH_SECONDS = 15;
-const STATE_TONE = { healthy: 'ok', degraded: 'warn', stopped: 'idle', unknown: 'bad' };
-const STATE_RANK = { unknown: 0, degraded: 1, stopped: 2, healthy: 3 };
+const STATE_TONE = { healthy: 'ok', syncing: 'sync', degraded: 'warn', stopped: 'idle', unknown: 'bad' };
+const STATE_RANK = { unknown: 0, degraded: 1, stopped: 2, syncing: 3, healthy: 4 };
 const HOST_RANK = { bad: 0, warn: 1, ok: 2 };
 
 const state = {
@@ -90,7 +90,8 @@ function toService(node, host) {
     tcpIn: node.connections ? node.connections.inbound : null, tcpOut: node.connections ? node.connections.outbound : null,
     identity: info.pubkey || null, serviceNode: info.service_node || null,
     registered: Boolean(info.service_node && info.service_node.registered),
-    processes: node.processes || [], problems: node.problems || [],
+    processes: node.processes || [], problems: node.problems || [], suppressed: node.suppressed || [],
+    sync: node.sync || null,
     state: node.state, reason: node.reason, needsAttention: Boolean(node.needs_attention),
   };
   if (node.error) {
@@ -249,7 +250,8 @@ function renderStatusBar() {
   const nodes = services.filter((service) => service.role === 'node');
   const registered = nodes.filter((service) => service.registered).length;
   const unreachable = state.hosts.filter((host) => host.agent !== 'online').length;
-  const behindHosts = state.hosts.filter((host) => host.services.some((service) => service.lagging)).length;
+  const syncing = services.filter((service) => service.state === 'syncing').length;
+  const behindHosts = state.hosts.filter((host) => host.services.some((service) => service.lagging && service.state !== 'syncing')).length;
 
   $('#fleet-count').textContent = `${state.hosts.length} host${state.hosts.length === 1 ? '' : 's'} · ${services.length} service${services.length === 1 ? '' : 's'}`;
 
@@ -270,6 +272,7 @@ function renderStatusBar() {
   metrics.append(metric('Healthy', `${healthy} / ${services.length}`, healthy === services.length && services.length ? 'ok' : null));
   metrics.append(metric('Height', String(state.fleet.tip), null, behindHosts ? `${behindHosts} host${behindHosts === 1 ? '' : 's'} behind` : ''));
   metrics.append(metric('Registered', `${registered} / ${nodes.length}`));
+  if (syncing) metrics.append(metric('Syncing', String(syncing), 'sync'));
   metrics.append(metric('Unreachable hosts', String(unreachable), unreachable ? 'bad' : null));
 
   const legend = $('#legend');
@@ -281,6 +284,7 @@ function renderStatusBar() {
   };
   legend.append(
     legendItem('ok', `healthy ${healthy}`),
+    legendItem('sync', `syncing ${syncing}`),
     legendItem('warn', `degraded ${services.filter((service) => service.state === 'degraded').length}`),
     legendItem('idle', `stopped ${services.filter((service) => service.state === 'stopped').length}`),
     legendItem('bad', `unreachable ${unreachable} host${unreachable === 1 ? '' : 's'}`),
@@ -387,6 +391,7 @@ function renderGroup(host, rows, narrow) {
 function badgeFor(service) {
   if (service.state === 'unknown') return pill('unknown', 'bad');
   if (service.state === 'stopped') return pill('stopped');
+  if (service.state === 'syncing') return pill('syncing', 'sync');
   if (service.needsAttention) return pill('attention', 'warn');
   if (service.role === 'node') return service.registered ? pill('registered', 'ok') : pill('unregistered', 'warn');
   return null;
@@ -426,7 +431,10 @@ function renderRow(service, narrow) {
   if (service.actionError) status.title = service.actionError;
   row.append(status);
   row.append(element('span', 'm num', service.running ? duration(service.uptime) : '—'));
-  row.append(element('span', `m num${service.lagging ? ' is-warn' : ''}`, service.height == null ? '—' : String(service.height)));
+  const heightCell = element('span', `m num${service.state === 'syncing' ? ' is-sync' : service.lagging ? ' is-warn' : ''}`,
+    service.state === 'syncing' ? `${service.sync.percent}%` : service.height == null ? '—' : String(service.height));
+  if (service.state === 'syncing') heightCell.title = `${service.height ?? '?'} of ${(service.height ?? 0) + service.sync.remaining}, ${service.sync.remaining} blocks to go`;
+  row.append(heightCell);
   if (!narrow) row.append(element('span', 'm peers', service.peersIn == null ? '—' : `${service.peersIn} / ${service.peersOut ?? '—'}`));
 
   const procs = element('div', 'procs');
@@ -535,6 +543,15 @@ function renderDrawer() {
     alert.append(dot('bad'), element('span', null, `Last action failed: ${service.actionError}`));
     alert.append(button('Dismiss', () => { delete state.errors[service.id]; refresh(true); }));
     head.append(alert);
+  } else if (service.state === 'syncing') {
+    const alert = element('div', 'alert is-sync');
+    const text = `Initial sync ${service.sync.percent}% · ${service.sync.remaining.toLocaleString()} blocks to go`
+      + (service.sync.recalled ? ` · RPC busy, last reading ${duration(service.sync.age)} ago` : '');
+    alert.append(dot('sync'), element('span', null, text));
+    head.append(alert);
+    if (service.suppressed.length) {
+      head.append(element('p', 'suppressed', `Waiting for sync before reporting: ${service.suppressed.join(', ')}`));
+    }
   } else if (service.state !== 'healthy') {
     const tone = STATE_TONE[service.state];
     const alert = element('div', `alert${tone !== 'warn' ? ` is-${tone}` : ''}`);
@@ -564,7 +581,8 @@ function renderDrawer() {
   const tiles = element('div', 'tiles');
   tiles.append(
     tile('Uptime', service.running ? duration(service.uptime) : '—'),
-    tile('Height', service.height == null ? '—' : String(service.height), service.lagging ? 'warn' : null),
+    tile('Height', service.state === 'syncing' ? `${service.sync.percent}%` : service.height == null ? '—' : String(service.height),
+      service.state === 'syncing' ? 'sync' : service.lagging ? 'warn' : null),
     tile('L2', `${service.l2Tracker ?? '—'} / ${service.l2Chain ?? '—'}`),
     tile('Peers', service.peersIn == null ? '—' : `${service.peersIn} / ${service.peersOut ?? '—'}`),
   );

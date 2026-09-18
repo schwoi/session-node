@@ -222,8 +222,10 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(proxy['container']['health'], 'starting')
         self.assertIsNone(proxy['node']['service_node'])
         self.assertEqual(proxy['node']['pings'], {})
-        self.assertEqual(proxy['problems'], ['120 blocks behind'])
-        self.assertEqual(proxy['state'], 'degraded')
+        # 120 blocks behind a 620 target is initial sync: expected, so nothing else is reported.
+        self.assertEqual((proxy['state'], proxy['reason'], proxy['needs_attention']), ('syncing', 'syncing 80.6%', False))
+        self.assertEqual(proxy['sync'], {'percent': 80.6, 'remaining': 120, 'recalled': False})
+        self.assertEqual((proxy['problems'], proxy['suppressed']), ([], []))
         stagenet = nodes['stagenet00']
         self.assertIsNone(stagenet['node'])
         self.assertEqual(stagenet['problems'], ['stopped 6m ago'])
@@ -376,6 +378,41 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('MANAGER_TOKEN', payload['peers'][0]['error'])
         self.assertEqual(self.request('/api/hosts/remote/nodes', headers={'Authorization': 'Bearer other'})[0], 401)
 
+    def test_syncing_suppresses_incidental_problems(self):
+        summary = {'role': 'node', 'container': {'state': 'running', 'health': 'unhealthy'}, 'processes': [],
+                   'node': {'rpc_ok': True, 'height': 1395229, 'target_height': 2201613, 'behind': 806384,
+                            'lagging': True, 'pings': {'lokinet': None}, 'l2_tracker_height': 5, 'l2_height': 9,
+                            'service_node': None},
+                   'sync': {'percent': 63.4, 'remaining': 806384, 'recalled': False}}
+        found = manager.problems(summary)
+        self.assertEqual(found, ['health check failing', 'lokinet never reported', '806384 blocks behind', 'L2 tracker 4 blocks behind'])
+        self.assertEqual(manager.assess(summary, found), {
+            'state': 'syncing', 'reason': 'syncing 63.4%', 'needs_attention': False,
+            'suppressed': ['health check failing', 'lokinet never reported', 'L2 tracker 4 blocks behind']})
+        summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': True, 'age': 40}
+        summary['node'] = None
+        self.assertEqual(manager.assess(summary)['reason'], 'syncing 63.4% · RPC busy')
+        self.assertIsNone(manager.sync_progress(2201600, 2201613))  # a few blocks behind is lag, not sync
+        self.assertIsNone(manager.sync_progress(5, 0))
+        self.assertEqual(manager.sync_progress(1000, 2000), (50.0, 1000))
+
+    def test_sync_memory_covers_busy_rpc(self):
+        mgr = self.server.manager
+        running = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 1000, 'target_height': 2000}}
+        self.assertEqual(mgr.sync_state('c1', running), {'percent': 50.0, 'remaining': 1000, 'recalled': False})
+        busy = {'container': {'state': 'running'}, 'node': None}
+        recalled = mgr.sync_state('c1', busy)
+        self.assertEqual((recalled['percent'], recalled['recalled']), (50.0, True))
+        self.assertIsNone(mgr.sync_state('unknown', busy))
+        synced = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 2000, 'target_height': 2000}}
+        self.assertIsNone(mgr.sync_state('c1', synced))
+        self.assertIsNone(mgr.sync_state('c1', busy))  # memory cleared once the node caught up
+        mgr.sync_state('c1', running)
+        mgr.sync_memory['c1'] = (1000, 2000, manager.time.monotonic() - manager.SYNC_MEMORY - 1)
+        self.assertIsNone(mgr.sync_state('c1', busy))  # too old to trust
+        self.assertIsNone(mgr.sync_state('c1', {'container': {'state': 'exited'}, 'node': None}))
+        self.assertNotIn('c1', mgr.sync_memory)
+
     def test_parse_peers(self):
         self.assertEqual(manager.parse_peers(''), {})
         self.assertEqual(manager.parse_peers('a=http://100.64.0.2:8080/, b=https://b.example\n'),
@@ -405,13 +442,13 @@ class ManagerTests(unittest.TestCase):
             'session-router never reported'])
         summary['node'] = None
         self.assertEqual(manager.problems(summary), ['health check failing', 'oxend RPC unreachable'])
-        self.assertEqual(manager.assess(summary), {'state': 'degraded', 'reason': 'health check failing', 'needs_attention': True})
+        self.assertEqual(manager.assess(summary), {'state': 'degraded', 'reason': 'health check failing', 'needs_attention': True, 'suppressed': []})
         summary['container'] = {'state': 'running', 'health': 'starting'}
         summary['node'] = {'rpc_ok': True, 'pings': {}, 'behind': 0, 'lagging': False,
                            'l2_tracker_height': None, 'l2_height': None, 'service_node': None}
-        self.assertEqual(manager.assess(summary), {'state': 'healthy', 'reason': 'starting', 'needs_attention': False})
+        self.assertEqual(manager.assess(summary), {'state': 'healthy', 'reason': 'starting', 'needs_attention': False, 'suppressed': []})
         summary['container'] = {'state': 'exited', 'health': None, 'stopped_ago': 4000}
-        self.assertEqual(manager.assess(summary), {'state': 'stopped', 'reason': 'stopped 1h 6m ago', 'needs_attention': True})
+        self.assertEqual(manager.assess(summary), {'state': 'stopped', 'reason': 'stopped 1h 6m ago', 'needs_attention': True, 'suppressed': []})
         self.assertEqual([manager.ago(s) for s in (5, 61, 3660, 90000)], ['5s', '1m', '1h 1m', '1d 1h'])
         ports = manager.service_ports({'P2P_PORT': '11032', 'QUORUMNET_PORT': 'bad'}, 'stagenet')
         self.assertEqual(ports, {11032: 'p2p', 22020: 'storage', 22021: 'storage https'})

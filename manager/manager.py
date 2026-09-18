@@ -35,6 +35,11 @@ PING_STALE = 300
 # target comes from oxend's peers, so it tracks the network tip even when every
 # node on this dashboard is still syncing.
 BEHIND_WARN = 2
+# Further behind than this and the node is doing its initial sync: expected, not an
+# incident, and the incidental problems it causes are held back until it catches up.
+SYNC_BEHIND = 100
+# How long a remembered sync snapshot may stand in for a node whose RPC is busy.
+SYNC_MEMORY = 3600
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
 PINGS = (('oxen-storage', 'last_storage_server_ping'), ('lokinet', 'last_lokinet_ping'),
          ('session-router', 'last_session_router_ping'))
@@ -215,15 +220,30 @@ def problems(summary):
     return found
 
 
+def sync_progress(height, target):
+    """Initial-sync progress as (percent, blocks left), or None when not in initial sync."""
+    if not target or height is None or target - height < SYNC_BEHIND:
+        return None
+    return round(100 * height / target, 1), target - height
+
+
 def assess(summary, found=None):
-    """The single derivation of service state: healthy, degraded, or stopped."""
+    """The single derivation of service state: healthy, syncing, degraded, or stopped."""
     found = problems(summary) if found is None else found
     if summary['container']['state'] != 'running':
-        return {'state': 'stopped', 'reason': found[0], 'needs_attention': True}
+        return {'state': 'stopped', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
+    node = summary['node'] or {}
+    sync = summary.get('sync')
+    if sync:
+        # Initial sync is expected. Everything else it causes waits until the chain has caught up.
+        reason = f"syncing {sync['percent']}%" + (' · RPC busy' if sync.get('recalled') else '')
+        suppressed = [item for item in found if not item.endswith('blocks behind') or item.startswith('L2')]
+        return {'state': 'syncing', 'reason': reason, 'needs_attention': False, 'suppressed': suppressed}
     if found:
-        return {'state': 'degraded', 'reason': found[0], 'needs_attention': True}
+        return {'state': 'degraded', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
     starting = summary['container']['health'] == 'starting'
-    return {'state': 'healthy', 'reason': 'starting' if starting else 'healthy', 'needs_attention': False}
+    return {'state': 'healthy', 'reason': 'starting' if starting else 'healthy', 'needs_attention': False,
+            'suppressed': []}
 
 
 def service_ports(env, network):
@@ -312,6 +332,7 @@ class Manager:
         self.peers = peers or {}
         self.token = token
         self.peer_seen = {}  # host -> monotonic time of the last successful overview
+        self.sync_memory = {}  # container id -> last (height, target, monotonic time) seen while syncing
 
     def containers(self):
         filters = urllib.parse.quote(json.dumps({'label': [f'com.docker.compose.project={self.project}']}))
@@ -372,9 +393,33 @@ class Manager:
                     stale = name in pings and (age is None or age > PING_STALE)
                     summary['processes'].append({**process, 'name': name, 'reported_ago': age,
                                                  'stale': stale or not process.get('alive', True)})
+        summary['sync'] = self.sync_state(container_id, summary)
         summary['problems'] = problems(summary)
         summary.update(assess(summary, summary['problems']))
+        if summary['state'] == 'syncing':
+            summary['problems'] = []
         return summary
+
+    def sync_state(self, container_id, summary):
+        """Initial-sync progress, remembered across probes so a busy RPC does not hide it."""
+        node = summary['node']
+        if not summary['container']['state'] == 'running':
+            self.sync_memory.pop(container_id, None)
+            return None
+        if node and node['rpc_ok']:
+            progress = sync_progress(node['height'], node['target_height'])
+            if progress:
+                self.sync_memory[container_id] = (node['height'], node['target_height'], time.monotonic())
+                return {'percent': progress[0], 'remaining': progress[1], 'recalled': False}
+            self.sync_memory.pop(container_id, None)
+            return None
+        remembered = self.sync_memory.get(container_id)
+        if remembered and time.monotonic() - remembered[2] < SYNC_MEMORY:
+            progress = sync_progress(remembered[0], remembered[1])
+            if progress:
+                return {'percent': progress[0], 'remaining': progress[1], 'recalled': True,
+                        'age': int(time.monotonic() - remembered[2])}
+        return None
 
     def probe(self, container_id):
         try:
