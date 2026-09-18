@@ -25,6 +25,7 @@ NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
 PEER_PATH = re.compile(r'nodes(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/(?:logs|status|print_sn_status|restart|stop|start|register))?)?')
 ETH_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+PORT = 8080
 STOP_TIMEOUT = 120
 PING_STALE = 300
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
@@ -254,9 +255,10 @@ def parse_peers(value):
             continue
         name, _, url = entry.partition('=')
         parts = urllib.parse.urlsplit(url)
-        if not NAME.fullmatch(name) or parts.scheme not in ('http', 'https') or not parts.netloc or parts.query:
+        if (not NAME.fullmatch(name) or parts.scheme not in ('http', 'https') or not parts.netloc
+                or parts.path not in ('', '/') or parts.query or parts.fragment):
             raise ValueError(f'MANAGER_PEERS entries must look like name=http://host:port, got {entry!r}')
-        peers[name] = url.rstrip('/')
+        peers[name] = f'{parts.scheme}://{parts.netloc}'
     return peers
 
 
@@ -572,10 +574,10 @@ def main():
     host = os.environ.get('MANAGER_HOST') or 'local'
     if not NAME.fullmatch(host):
         sys.exit('MANAGER_HOST must be a short name of letters, digits, dots, dashes, or underscores')
-    address = (os.environ.get('MANAGER_LISTEN', '0.0.0.0'), int(os.environ.get('MANAGER_PORT', '8080')))
-    server = http.server.ThreadingHTTPServer(address, Handler)
+    # Always port 8080 inside the container; Compose chooses the host address and port.
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     server.manager = Manager(docker, project, service, host, peers, token)
-    print(f'Managing Compose project {project} as host {host} on http://{address[0]}:{address[1]}', flush=True)
+    print(f'Managing Compose project {project} as host {host} on container port {PORT}', flush=True)
     for name, url in peers.items():
         print(f'Peer {name}: {url}', flush=True)
     try:

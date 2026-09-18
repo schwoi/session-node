@@ -361,7 +361,8 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(manager.parse_peers(''), {})
         self.assertEqual(manager.parse_peers('a=http://100.64.0.2:8080/, b=https://b.example\n'),
                          {'a': 'http://100.64.0.2:8080', 'b': 'https://b.example'})
-        for bad in ('a', 'a=100.64.0.2:8080', 'bad name=http://x', 'a=ftp://x', 'a=http://x?y=1'):
+        for bad in ('a', 'a=100.64.0.2:8080', 'bad name=http://x', 'a=ftp://x', 'a=http://x?y=1',
+                    'a=http://x:8080/x', 'a=http://x:8080/api', 'a=http://x#frag'):
             with self.assertRaises(ValueError):
                 manager.parse_peers(bad)
 
