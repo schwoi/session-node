@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +28,13 @@ ETH_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 PORT = 8080
 STOP_TIMEOUT = 120
+# Seconds without a companion report before it counts as not reporting. Matches
+# healthcheck.sh so the dashboard and Docker's health status never disagree.
 PING_STALE = 300
+# Blocks behind the daemon's own sync target before a node counts as lagging. The
+# target comes from oxend's peers, so it tracks the network tip even when every
+# node on this dashboard is still syncing.
+BEHIND_WARN = 2
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
 PINGS = (('oxen-storage', 'last_storage_server_ping'), ('lokinet', 'last_lokinet_ping'),
          ('session-router', 'last_session_router_ping'))
@@ -38,12 +45,19 @@ PROBE = r'''
 set -uo pipefail
 port=22023
 [[ ${NETWORK:-mainnet} != stagenet ]] || port=11023
-rpc() { curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+# A node under sync load can take well over five seconds to answer; allow fifteen,
+# and issue the three RPC calls at once so the probe never waits longer than that.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+rpc() { curl -fsS --max-time 15 -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\"}" "http://127.0.0.1:$port/json_rpc"; }
-info=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/get_info") || info=null
-keys=$(rpc get_service_keys) || keys=null
-sn=null
-[[ ${ROLE:-node} != node ]] || sn=$(rpc get_service_node_status) || sn=null
+curl -fsS --max-time 15 "http://127.0.0.1:$port/get_info" > "$tmp/info" 2>/dev/null &
+rpc get_service_keys > "$tmp/keys" 2>/dev/null &
+[[ ${ROLE:-node} != node ]] || rpc get_service_node_status > "$tmp/sn" 2>/dev/null &
+wait
+info=$(jq -c . "$tmp/info" 2>/dev/null) || info=null
+keys=$(jq -c . "$tmp/keys" 2>/dev/null) || keys=null
+sn=$(jq -c . "$tmp/sn" 2>/dev/null) || sn=null
 procs='[]'
 if [[ -s /run/session-node.pids ]]; then
   procs=$(while IFS= read -r pid; do
@@ -156,35 +170,60 @@ def parse_time(value):
     return datetime.fromisoformat(value.replace('Z', '+00:00'))
 
 
+def ago(seconds):
+    """Compact duration such as 45s, 6m, 2h 10m, or 3d 4h."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f'{seconds}s'
+    minutes, hours, days = seconds // 60, seconds // 3600, seconds // 86400
+    if minutes < 60:
+        return f'{minutes}m'
+    if hours < 24:
+        return f'{hours}h {minutes % 60}m'
+    return f'{days}d {hours % 24}h'
+
+
 def problems(summary):
+    """Short status phrases, worst first; empty when nothing needs attention."""
     container, node = summary['container'], summary['node']
     found = []
     if container['state'] != 'running':
-        return [f"Container is {container['state']}"]
-    if container['health'] not in (None, 'healthy'):
-        found.append(f"Docker health check: {container['health']}")
+        stopped = container.get('stopped_ago')
+        return [f'stopped {ago(stopped)} ago' if stopped is not None else container['state']]
+    if container['health'] == 'unhealthy':
+        found.append('health check failing')
     if summary['role'] not in ('node', 'proxy'):
         return found
     if node is None or not node['rpc_ok']:
-        return found + ['oxend RPC is unreachable']
+        return found + ['oxend RPC unreachable']
     for process in summary['processes']:
         if not process['alive']:
-            found.append(f"{process['name'] or process['pid']} is not running")
+            found.append(f"{process['name'] or process['pid']} not running")
     for service, age in node['pings'].items():
         if age is None:
-            found.append(f'{service} has never reported to oxend')
+            found.append(f'{service} never reported')
         elif age > PING_STALE:
-            found.append(f'{service} last reported {int(age // 60)} minutes ago')
-    behind = (node['target_height'] or 0) - (node['height'] or 0)
-    if behind > 1:
-        found.append(f'Blockchain is {behind} blocks behind')
+            found.append(f'{service} not reporting ({ago(age)})')
+    if node['behind'] >= BEHIND_WARN:
+        found.append(f"{node['behind']} blocks behind")
     tracker, chain = node['l2_tracker_height'], node['l2_height']
     if tracker is not None and chain is not None and tracker < chain:
-        found.append(f'L2 tracker is {chain - tracker} blocks behind the chain')
+        found.append(f'L2 tracker {chain - tracker} blocks behind')
     service_node = node['service_node']
     if service_node and service_node['registered'] and service_node['active'] is False:
-        found.append('Service node is decommissioned')
+        found.append('decommissioned')
     return found
+
+
+def assess(summary, found=None):
+    """The single derivation of service state: healthy, degraded, or stopped."""
+    found = problems(summary) if found is None else found
+    if summary['container']['state'] != 'running':
+        return {'state': 'stopped', 'reason': found[0], 'needs_attention': True}
+    if found:
+        return {'state': 'degraded', 'reason': found[0], 'needs_attention': True}
+    starting = summary['container']['health'] == 'starting'
+    return {'state': 'healthy', 'reason': 'starting' if starting else 'healthy', 'needs_attention': False}
 
 
 def service_ports(env, network):
@@ -225,7 +264,9 @@ def describe(probe, role, network):
             'start_time': info.get('start_time'), 'status_line': info.get('status_line'),
             'peers': {'inbound': info.get('incoming_connections_count'),
                       'outbound': info.get('outgoing_connections_count')},
+            'behind': max(0, (info.get('target_height') or 0) - (info.get('height') or 0)),
             'pubkey': keys.get('service_node_ed25519_pubkey'), 'pings': {}, 'service_node': None}
+    node['lagging'] = node['behind'] >= BEHIND_WARN
     if role == 'node' and network == 'mainnet':
         for service, key in PINGS:
             stamp = info.get(key)
@@ -270,6 +311,7 @@ class Manager:
         self.host = host
         self.peers = peers or {}
         self.token = token
+        self.peer_seen = {}  # host -> monotonic time of the last successful overview
 
     def containers(self):
         filters = urllib.parse.quote(json.dumps({'label': [f'com.docker.compose.project={self.project}']}))
@@ -303,14 +345,17 @@ class Manager:
         details = details or self.details(name, container_id)
         env = details['env']
         state = details['State']
+        now = datetime.now(timezone.utc)
         started = parse_time(state.get('StartedAt')) if state.get('Running') else None
+        finished = parse_time(state.get('FinishedAt')) if not state.get('Running') else None
         summary = {
             'name': name, 'network': env.get('NETWORK', 'mainnet'), 'role': env.get('ROLE', 'node'),
             'container': {
                 'id': container_id[:12], 'state': state.get('Status'),
                 'health': (state.get('Health') or {}).get('Status'),
                 'started_at': started.isoformat() if started else None,
-                'uptime': int((datetime.now(timezone.utc) - started).total_seconds()) if started else None,
+                'uptime': int((now - started).total_seconds()) if started else None,
+                'stopped_ago': int((now - finished).total_seconds()) if finished else None,
                 'restart_count': details.get('RestartCount', 0), 'image': details['Config'].get('Image')},
             'node': None, 'processes': [], 'connections': None, 'problems': []}
         if state.get('Running') and summary['role'] in ('node', 'proxy'):
@@ -319,14 +364,21 @@ class Manager:
                 summary['node'] = describe(probe, summary['role'], summary['network'])
                 summary['connections'] = connections(probe.get('connections'),
                                                      service_ports(env, summary['network']))
-                summary['processes'] = [{**process, 'name': PROCESS_NAMES.get(process.get('name'), process.get('name'))}
-                                        for process in probe.get('processes') or []]
+                pings = summary['node']['pings']
+                for process in probe.get('processes') or []:
+                    name = PROCESS_NAMES.get(process.get('name'), process.get('name'))
+                    age = pings.get(name)
+                    # Stale means the companion stopped reporting to oxend, or never started reporting.
+                    stale = name in pings and (age is None or age > PING_STALE)
+                    summary['processes'].append({**process, 'name': name, 'reported_ago': age,
+                                                 'stale': stale or not process.get('alive', True)})
         summary['problems'] = problems(summary)
+        summary.update(assess(summary, summary['problems']))
         return summary
 
     def probe(self, container_id):
         try:
-            code, stdout, output = self.docker.exec(container_id, ['bash', '-c', PROBE])
+            code, stdout, output = self.docker.exec(container_id, ['bash', '-c', PROBE], timeout=75)
             if code == 0:
                 return json.loads(stdout)
             reason = f'exit code {code}: {output.strip()[-300:]}'
@@ -361,9 +413,12 @@ class Manager:
             data = json.loads(payload)
             if status != 200 or not isinstance(data, dict):
                 raise ValueError(data.get('error') if isinstance(data, dict) else f'HTTP {status}')
+            self.peer_seen[host] = time.monotonic()
             return {'host': host, 'project': data.get('project'), 'nodes': data.get('nodes') or []}
         except (OSError, ValueError) as error:
-            return {'host': host, 'project': None, 'nodes': [], 'error': f'{self.peers[host]}: {error}'}
+            seen = self.peer_seen.get(host)
+            return {'host': host, 'project': None, 'nodes': [], 'error': f'{self.peers[host]}: {error}',
+                    'last_seen_ago': int(time.monotonic() - seen) if seen is not None else None}
 
     def forward(self, host, method, path, body=None, timeout=STOP_TIMEOUT + 60):
         """Relay an API call to a peer manager using this manager's own token."""
@@ -426,7 +481,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'")
+        self.send_header('Content-Security-Policy',
+                         "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+                         "font-src 'self' https://fonts.gstatic.com; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
 

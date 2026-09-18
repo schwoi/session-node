@@ -268,20 +268,33 @@ Follow the registration URL to stake. Before staking, verify full chain/L2 synch
 ## Management dashboard
 
 The optional `manager` service is a separate container that shows every node in
-this Compose project and lets you act on it from a browser or the JSON API:
+this Compose project and lets you act on it from a browser or the JSON API. The
+page is built for scanning a fleet: a status bar leads with how many services
+need attention, hosts are collapsible groups in one table, and a detail drawer
+opens for the selected row (arrow keys move the selection, Escape closes it).
+Each service has exactly one state, derived once in the backend:
 
-- container state, Docker health, uptime, image, and restart count;
-- oxend version, chain height versus sync target, and L2 tracker height;
-- each supervised process (`oxend`, `oxen-storage`, `lokinet`, `session-router`)
-  with the age of its last report to oxend;
-- inbound and outbound connections: oxend's P2P peer counts, plus established
-  TCP connections per service port (p2p, quorumnet, storage) read from the
-  container. Lokinet and Session Router relay over UDP and have no connections
-  to count;
-- node identity and staking state: unregistered, registered, awaiting stake,
-  or decommissioned;
-- container logs, `oxend status`, and `print_sn_status` output;
-- restart, stop, and start; and registration for staking.
+- **healthy**: running, every companion reported recently, chain within tolerance;
+- **degraded**: running, but a companion stopped reporting, the chain is behind,
+  the health check fails, or oxend's RPC does not answer; the Status column
+  says which;
+- **stopped**: the container is not running. It still counts as needing
+  attention, but it is shown in grey rather than red because a deliberate stop
+  is not an outage;
+
+A host whose manager cannot be reached is a different case: its services have no
+state at all, so the dashboard shows the host as a red, collapsed **unreachable**
+group with how long ago it last answered, rather than guessing that its nodes
+are down.
+
+Rows show uptime, height, P2P peers, one chip per supervised process
+(`oxend`, `oxen-storage`, `lokinet`, `session-router`) coloured by its own
+reporting state, and version drift against the rest of the fleet. The drawer
+adds L2 tracker height, per-process report ages, TCP connections per service
+port, image and version, identity, and staking state. Actions: logs,
+`oxend status`, `print_sn_status`, restart, stop, start, bulk restart or stop
+of selected rows, and registration for staking. The layout targets desktop
+widths; on narrow screens the table scrolls sideways.
 
 ```bash
 docker compose up -d --no-build manager
