@@ -19,6 +19,7 @@ manager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(manager)
 
 PROJECT = 'session-node'
+PROBE_MARKER = 'set -uo pipefail'
 NOW = 1_800_000_000
 INFO = {'status': 'OK', 'version': '11.6.1', 'height': 500, 'target_height': 0, 'l2_height': 900,
         'l2_tracker_height': 905, 'start_time': NOW - 3600, 'last_storage_server_ping': NOW - 20,
@@ -118,7 +119,9 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
             exec_id = f'exec-{len(self.execs)}'
             self.calls.append(('exec', name, command))
             stderr = b''
-            if command[0] == 'bash':
+            if 'bash' in command and PROBE_MARKER in command[-1]:
+                # The probe must run in its own process group under a hard deadline.
+                assert command[:2] == ['setsid', '-w'] and command[2] == 'timeout' and 'KILL' in command, command
                 output, code = json.dumps(PROBES[name]).encode(), 0
                 stderr = b'curl: (7) Failed to connect to 127.0.0.1 port 22023\n'
             elif 'register' in command:
@@ -430,6 +433,45 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn('c1', mgr.sync_memory)  # and forgotten, not kept forever
         self.assertIsNone(mgr.sync_state('c1', {'container': {'state': 'exited'}, 'node': None}))
         self.assertNotIn('c1', mgr.sync_memory)
+
+    def test_probe_runs_once_per_container_at_a_time(self):
+        mgr = self.server.manager
+        lock = mgr.probe_locks.setdefault('busy.container', manager.threading.Lock())
+        lock.acquire()
+        try:
+            self.assertIsNone(mgr.probe('busy.container'))  # skipped, not queued behind the running one
+        finally:
+            lock.release()
+        self.assertEqual([c for c in FakeDocker.calls if c[0] == 'exec' and c[1] == 'busy'], [])
+        self.assertIsNotNone(mgr.probe('oxen00.container'))
+        self.assertFalse(mgr.probe_locks['oxen00.container'].locked())
+
+    def test_overview_is_coalesced_and_peers_do_not_recurse(self):
+        mgr = self.server.manager
+        mgr.overview_cache = (0.0, None)
+        first = mgr.overview()
+        probes = len([c for c in FakeDocker.calls if c[0] == 'exec'])
+        second = mgr.overview()
+        self.assertEqual(first['nodes'], second['nodes'])
+        self.assertEqual(len([c for c in FakeDocker.calls if c[0] == 'exec']), probes)  # served from cache
+        mgr.overview_cache = (manager.time.monotonic() - manager.OVERVIEW_CACHE - 1, first['nodes'])
+        mgr.overview()
+        self.assertGreater(len([c for c in FakeDocker.calls if c[0] == 'exec']), probes)  # expired: a new round
+        # A peer asked for its nodes answers without fanning out to its own peers.
+        self.server.manager.token = 'secret'
+        self.peer.manager.peers = {'loop': f'http://127.0.0.1:{self.server.server_port}'}
+        try:
+            status, payload = self.request('/api/nodes?peers=0', headers={'Authorization': 'Bearer secret'})
+            self.assertEqual((status, payload['peers']), (200, []))
+            self.server.manager.peers = {'remote': f'http://127.0.0.1:{self.peer.server_port}'}
+            self.server.manager.overview_cache = (0.0, None)
+            status, payload = self.request('/api/nodes', headers={'Authorization': 'Bearer secret'})
+            self.assertEqual(status, 200)
+            remote, = payload['peers']
+            self.assertIsNone(remote.get('error'))
+            self.assertNotIn('peers', remote)  # the peer's own peer list is never relayed
+        finally:
+            self.peer.manager.peers = {}
 
     def test_parse_peers(self):
         self.assertEqual(manager.parse_peers(''), {})

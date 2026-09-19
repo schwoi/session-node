@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -40,6 +41,12 @@ BEHIND_WARN = 2
 SYNC_BEHIND = 100
 # How long a remembered sync snapshot may stand in for a node whose RPC is busy.
 SYNC_MEMORY = 3600
+# Hard ceiling on one probe inside a node container. The probe is killed at this
+# point so a stalled node can never accumulate probe processes across polls.
+PROBE_DEADLINE = 40
+# A finished overview is reused for this long, so several browsers, a peer, and
+# auto-refresh share one probe round instead of each starting their own.
+OVERVIEW_CACHE = 10
 # How recent oxend's own "Synced H/T" log line must be to count as current progress.
 SYNC_LOG_FRESH = 600
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
@@ -355,6 +362,9 @@ class Manager:
         self.peers = peers or {}
         self.token = token
         self.peer_seen = {}  # host -> monotonic time of the last successful overview
+        self.probe_locks = {}  # container id -> lock held while its probe runs
+        self.overview_lock = threading.Lock()
+        self.overview_cache = (0.0, None)  # (monotonic time, result) of the last local listing
         self.sync_memory = {}  # container id -> last (height, target, monotonic time) seen while syncing
 
     def containers(self):
@@ -459,13 +469,25 @@ class Manager:
         return None
 
     def probe(self, container_id):
+        """Run the probe with a hard deadline, and never more than once per container at a time."""
+        lock = self.probe_locks.setdefault(container_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            print(f'Probe of container {container_id[:12]} skipped; the previous one is still running',
+                  file=sys.stderr, flush=True)
+            return None
         try:
-            code, stdout, output = self.docker.exec(container_id, ['bash', '-c', PROBE], timeout=75)
+            # setsid puts the probe in its own process group and timeout(1) kills that whole
+            # group at the deadline, so no curl or jq child is left behind inside the node
+            # even if the Docker exec itself is abandoned.
+            command = ['setsid', '-w', 'timeout', '-s', 'KILL', '-k', '5', str(PROBE_DEADLINE), 'bash', '-c', PROBE]
+            code, stdout, output = self.docker.exec(container_id, command, timeout=PROBE_DEADLINE + 10)
             if code == 0:
                 return json.loads(stdout)
-            reason = f'exit code {code}: {output.strip()[-300:]}'
+            reason = 'killed at the deadline' if code == 137 else f'exit code {code}: {output.strip()[-300:]}'
         except (DockerError, OSError, ValueError) as error:
             reason = str(error)
+        finally:
+            lock.release()
         print(f'Probe of container {container_id[:12]} failed; {reason}', file=sys.stderr, flush=True)
         return None
 
@@ -482,16 +504,32 @@ class Manager:
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             return sorted(filter(None, pool.map(one, containers.items())), key=lambda node: node['name'])
 
-    def overview(self):
+    def local_nodes(self):
+        """The local listing, computed at most once per OVERVIEW_CACHE seconds.
+
+        Callers that arrive while a round is running wait for that round rather than
+        starting another, so the probe rate is bounded by the poll interval no matter
+        how many browsers or peers are asking.
+        """
+        with self.overview_lock:
+            stamp, cached = self.overview_cache
+            if cached is not None and time.monotonic() - stamp < OVERVIEW_CACHE:
+                return cached
+            result = self.nodes()
+            self.overview_cache = (time.monotonic(), result)
+            return result
+
+    def overview(self, include_peers=True):
         """Local nodes plus one entry per peer manager, fetched concurrently."""
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            local = pool.submit(self.nodes)
-            peers = list(pool.map(self.peer_overview, self.peers))
+            local = pool.submit(self.local_nodes)
+            peers = list(pool.map(self.peer_overview, self.peers)) if include_peers else []
             return {'host': self.host, 'project': self.project, 'nodes': local.result(), 'peers': peers}
 
     def peer_overview(self, host):
         try:
-            status, _, payload = self.forward(host, 'GET', 'nodes', timeout=120)
+            # Peers answer for their own nodes only, so two hubs listing each other never recurse.
+            status, _, payload = self.forward(host, 'GET', 'nodes?peers=0', timeout=PROBE_DEADLINE + 20)
             data = json.loads(payload)
             if status != 200 or not isinstance(data, dict):
                 raise ValueError(data.get('error') if isinstance(data, dict) else f'HTTP {status}')
@@ -601,7 +639,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    if self.token else 'Set MANAGER_TOKEN to serve hosts other than localhost'})
         parts = url.path.split('/')[2:]
         if method == 'GET' and parts == ['nodes']:
-            return self.send(200, self.manager.overview())
+            return self.send(200, self.manager.overview(include_peers=query.get('peers', ['1'])[0] != '0'))
         if parts[0] == 'hosts':
             return self.relay(method, parts[1:], url.query)
         if len(parts) < 2 or parts[0] != 'nodes' or not NAME.fullmatch(parts[1]):
