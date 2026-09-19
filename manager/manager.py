@@ -493,6 +493,7 @@ class Manager:
 
     def nodes(self):
         containers = self.containers()
+        self.forget_stale(set(containers.values()))
 
         def one(item):
             try:
@@ -503,6 +504,14 @@ class Manager:
                 return {'name': item[0], 'error': str(error)}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             return sorted(filter(None, pool.map(one, containers.items())), key=lambda node: node['name'])
+
+    def forget_stale(self, current):
+        """Drop per-container state for containers that no longer exist (recreated services)."""
+        for container_id in [c for c in self.sync_memory if c not in current]:
+            self.sync_memory.pop(container_id, None)
+        for container_id, lock in [(c, l) for c, l in self.probe_locks.items() if c not in current]:
+            if not lock.locked():  # a running probe keeps its lock until it finishes
+                self.probe_locks.pop(container_id, None)
 
     def local_nodes(self):
         """The local listing, computed at most once per OVERVIEW_CACHE seconds.

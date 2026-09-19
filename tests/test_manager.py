@@ -446,6 +446,22 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNotNone(mgr.probe('oxen00.container'))
         self.assertFalse(mgr.probe_locks['oxen00.container'].locked())
 
+    def test_state_for_recreated_containers_is_pruned(self):
+        mgr = self.server.manager
+        mgr.sync_memory['gone.container'] = (1, 2, manager.time.monotonic(), False)
+        mgr.probe_locks['gone.container'] = manager.threading.Lock()
+        held = manager.threading.Lock(); held.acquire()
+        mgr.probe_locks['gone-but-probing.container'] = held
+        try:
+            mgr.nodes()
+            self.assertNotIn('gone.container', mgr.sync_memory)
+            self.assertNotIn('gone.container', mgr.probe_locks)
+            self.assertIn('gone-but-probing.container', mgr.probe_locks)  # kept while its probe runs
+            self.assertIn('oxen00.container', mgr.probe_locks)
+        finally:
+            held.release()
+            mgr.probe_locks.pop('gone-but-probing.container', None)
+
     def test_overview_is_coalesced_and_peers_do_not_recurse(self):
         mgr = self.server.manager
         mgr.overview_cache = (0.0, None)
