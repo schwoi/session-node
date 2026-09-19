@@ -363,6 +363,7 @@ class Manager:
         self.token = token
         self.peer_seen = {}  # host -> monotonic time of the last successful overview
         self.probe_locks = {}  # container id -> lock held while its probe runs
+        self.state_lock = threading.Lock()  # guards sync_memory and probe_locks themselves
         self.overview_lock = threading.Lock()
         self.overview_cache = (0.0, None)  # (monotonic time, result) of the last local listing
         self.sync_memory = {}  # container id -> last (height, target, monotonic time) seen while syncing
@@ -436,6 +437,10 @@ class Manager:
 
     def sync_state(self, container_id, summary, synclog=None):
         """Initial-sync progress from RPC, else from oxend's own log, else remembered from earlier."""
+        with self.state_lock:
+            return self._sync_state(container_id, summary, synclog)
+
+    def _sync_state(self, container_id, summary, synclog):
         node = summary['node']
         if not summary['container']['state'] == 'running':
             self.sync_memory.pop(container_id, None)
@@ -470,7 +475,8 @@ class Manager:
 
     def probe(self, container_id):
         """Run the probe with a hard deadline, and never more than once per container at a time."""
-        lock = self.probe_locks.setdefault(container_id, threading.Lock())
+        with self.state_lock:
+            lock = self.probe_locks.setdefault(container_id, threading.Lock())
         if not lock.acquire(blocking=False):
             print(f'Probe of container {container_id[:12]} skipped; the previous one is still running',
                   file=sys.stderr, flush=True)
@@ -507,11 +513,12 @@ class Manager:
 
     def forget_stale(self, current):
         """Drop per-container state for containers that no longer exist (recreated services)."""
-        for container_id in [c for c in self.sync_memory if c not in current]:
-            self.sync_memory.pop(container_id, None)
-        for container_id, lock in [(c, l) for c, l in self.probe_locks.items() if c not in current]:
-            if not lock.locked():  # a running probe keeps its lock until it finishes
-                self.probe_locks.pop(container_id, None)
+        with self.state_lock:
+            for container_id in [c for c in self.sync_memory if c not in current]:
+                self.sync_memory.pop(container_id, None)
+            for container_id, lock in [(c, l) for c, l in self.probe_locks.items() if c not in current]:
+                if not lock.locked():  # a running probe keeps its lock until it finishes
+                    self.probe_locks.pop(container_id, None)
 
     def local_nodes(self):
         """The local listing, computed at most once per OVERVIEW_CACHE seconds.
