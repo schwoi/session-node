@@ -374,6 +374,7 @@ class Manager:
             entry = self.schedule[name]
             cid = entry['id']
             revision = entry.get('revision', 0)
+            generation = entry.get('generation')
             self.inflight = name
             self.forced.discard(name)
             self.last_started[name] = now
@@ -387,7 +388,8 @@ class Manager:
             summary = {'name': name, 'error': str(error),
                        'sample': {'at': datetime.now(timezone.utc).isoformat(), 'state': 'failed'}}
         with self.lock:
-            if name in self.schedule and self.schedule[name].get('revision', 0) == revision:
+            if (self.schedule.get(name) is entry and entry.get('revision', 0) == revision
+                    and entry.get('generation') == generation):
                 self.cache[name] = summary
             self.inflight = None
             self.next_probe = self.clock() + PROBE_GAP

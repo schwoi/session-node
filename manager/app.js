@@ -272,14 +272,15 @@ async function power(node, action, verb) {
 
 async function run(task) {
   state.busy = true;
-  for (const node of nodesElement.querySelectorAll('button')) node.disabled = true;
+  const buttons = [...nodesElement.querySelectorAll('button')].map(node => [node, node.disabled]);
+  for (const [node] of buttons) node.disabled = true;
   try {
     await task();
   } catch (error) {
     showMessage(error.message);
   } finally {
     state.busy = false;
-    for (const node of nodesElement.querySelectorAll('button')) node.disabled = false;
+    for (const [node, disabled] of buttons) node.disabled = disabled;
   }
 }
 

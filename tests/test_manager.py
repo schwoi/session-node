@@ -481,6 +481,45 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(instance.cached('oxen00')['sample']['at'])
         self.assertIsNone(instance.cached('oxen00')['node'])
 
+    def test_inflight_sample_cannot_replace_new_container_generation(self):
+        for recreated in (False, True):
+            with self.subTest(recreated=recreated):
+                instance = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager',
+                                           clock=lambda: self.tick)
+                instance.discover()
+                instance.refresh('oxen00')
+                entered, release = threading.Event(), threading.Event()
+                original = instance.inspect
+
+                def slow(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    if kwargs.get('probe', True):
+                        entered.set()
+                        if not release.wait(5):
+                            raise TimeoutError('test did not release probe')
+                    return result
+
+                with patch.object(instance, 'inspect', side_effect=slow):
+                    worker = threading.Thread(target=instance.collect_one)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        details = instance.details('oxen00', 'oxen00.container')
+                        details['State']['StartedAt'] = '2026-09-20T00:00:00Z'
+                        cid = 'new.container' if recreated else 'oxen00.container'
+                        with patch.object(instance, 'containers', return_value={'oxen00': cid}), \
+                                patch.object(instance, 'details', return_value=details):
+                            instance.discover()
+                    finally:
+                        release.set()
+                        worker.join(5)
+                self.assertFalse(worker.is_alive())
+                sample = instance.cached('oxen00')
+                self.assertEqual(sample['sample']['state'], 'pending')
+                self.assertIsNone(sample['sample']['at'])
+                self.assertIsNone(sample['node'])
+                self.assertEqual(sample['container']['id'], cid[:12])
+
     def test_connection_scan_handles_ipv4_ipv6_and_listener_order(self):
         # Run the actual probe's connection parser against kernel-format fixtures.
         parser = manager.PROBE.split('conns=$(\n', 1)[1].split('\njq -cn --argjson info', 1)[0]
