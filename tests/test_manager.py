@@ -119,9 +119,12 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
             return self.reply(200, listing)
         if parts[0] == 'containers' and parts[-1] == 'json':
             name = parts[1].split('.')[0]
+            if name not in CONTAINERS:
+                return self.reply(404, {'message': f'No such container: {parts[1]}'})
             state, health, env = CONTAINERS[name]
             details = {'Id': parts[1], 'RestartCount': 2 if name == 'oxen00' else 0,
-                       'Config': {'Env': env, 'Image': 'ghcr.io/schwoi/session-node:11.6.1.0'},
+                       'Config': {'Env': env, 'Image': 'ghcr.io/schwoi/session-node:11.6.1.0',
+                                  'Labels': {'com.docker.compose.project': PROJECT, 'com.docker.compose.service': name}},
                        'State': {'Status': state, 'Running': state == 'running',
                                  'StartedAt': '2026-09-17T10:00:00.123456789Z',
                                  'FinishedAt': FINISHED}}
@@ -477,6 +480,17 @@ class ManagerTests(unittest.TestCase):
                      '/api/hosts/remote/nodes/../x', '/api/hosts'):
             self.assertEqual(self.request(path, headers=auth)[0], 404, path)
         self.assertEqual(self.request('/api/hosts/down/nodes', headers=auth)[0], 502)
+        # A peer whose post-action sample has not landed answers 202; the hub still re-fetches it.
+        fetched = self.request('/api/nodes', headers=auth)[1]['peers'][1]['sample']['at']
+        original = manager.REFRESH_WAIT
+        manager.REFRESH_WAIT = 0
+        try:
+            status, payload = self.request('/api/hosts/remote/nodes/oxen00/restart', {},
+                                           {**auth, 'X-Requested-With': 'session-node-manager'}, 'POST')
+        finally:
+            manager.REFRESH_WAIT = original
+        self.assertEqual((status, payload['name']), (202, 'oxen00'))
+        self.assertNotEqual(self.request('/api/nodes', headers=auth)[1]['peers'][1]['sample']['at'], fetched)
         # The peer accepts only the shared token; a hub with the wrong token is rejected by the peer.
         self.server.manager.token = 'other'
         self.server.manager.refresh_peer('remote')
@@ -857,6 +871,26 @@ class ManagerTests(unittest.TestCase):
         FakeDocker.hooks.clear()
         collector.step()
         self.assertTrue(ticket.event.is_set())
+
+    def test_identify_uses_the_mounted_container_id_not_the_hostname(self):
+        sample = ('10779 10770 0:52 /brent/.local/share/docker/containers/' + 'c8' * 32 + '/hostname /etc/hostname '
+                  'rw,nodev,relatime - zfs rpool/USERDATA/home rw\n'
+                  '10781 10770 0:52 /brent/.local/share/docker/containers/' + 'c8' * 32 + '/resolv.conf /etc/resolv.conf rw - zfs x rw\n')
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'mountinfo'
+            path.write_text(sample)
+            self.assertEqual(manager.own_container_id(str(path)), 'c8' * 32)
+            path.write_text('10779 10770 0:52 / / rw - ext4 /dev/sda1 rw\n')
+            self.assertIsNone(manager.own_container_id(str(path)))
+            self.assertIsNone(manager.own_container_id(str(Path(temp) / 'missing')))
+        docker = manager.Docker(self.socket_path)
+        self.assertEqual(manager.identify(docker, 'manager.container'), (PROJECT, 'manager'))
+        # A recreated container that inherited the old container's hostname must say so, not crash-loop.
+        with self.assertRaises(SystemExit) as stopped:
+            manager.identify(docker, 'e10773777f0a')
+        self.assertIn('e10773777f0a', str(stopped.exception))
+        self.assertIn('DOCKER_SOCKET', str(stopped.exception))
+        self.assertIn(self.socket_path, str(stopped.exception))  # names the socket actually in use
 
     def test_parse_peers(self):
         self.assertEqual(manager.parse_peers(''), {})
