@@ -90,10 +90,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Before anything pulls or pushes. Best effort: a pull request's token may not be
-      # allowed to log in, and a public package can still be pulled without it.
+      # Before anything pulls or pushes. On a pull request this is best effort: its token
+      # may not be allowed to log in, and a public package can still be pulled without it.
+      # Anywhere else a failed login must fail here, not later at the push.
       - name: Log in to GitHub Container Registry
-        continue-on-error: true
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
