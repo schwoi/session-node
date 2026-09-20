@@ -100,14 +100,17 @@ jobs:
       # Nothing that goes into the node image changed: test against the image that is
       # already published instead of building, and later republishing, an identical one.
       - name: Use the published node image
+        id: published
         if: needs.changes.outputs.node != 'true'
         run: |
           image="${REGISTRY}/${IMAGE_NAME,,}:latest"
           if docker pull "$image"; then
             docker tag "$image" session-node:local
+            echo "built=false" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::No published node image at $image; building one for the tests"
             docker build --pull -t session-node:local .
+            echo "built=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build management image
@@ -116,9 +119,10 @@ jobs:
       - name: Test management API against a fake Docker socket
         run: python3 tests/test_manager.py
 
-      # Exercises the packaged daemons inside the node image; a published image already passed it.
+      # Exercises the packaged daemons inside the node image. A published image already
+      # passed it; any image built in this run, including the fallback above, must.
       - name: Smoke test packaged services
-        if: needs.changes.outputs.node == 'true'
+        if: needs.changes.outputs.node == 'true' || steps.published.outputs.built == 'true'
         run: bash tests/container-smoke.sh session-node:local
 
       - name: Smoke test management dashboard with real containers
