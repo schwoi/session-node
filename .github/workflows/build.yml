@@ -87,6 +87,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Before anything pulls or pushes. Best effort: a pull request's token may not be
+      # allowed to log in, and a public package can still be pulled without it.
+      - name: Log in to GitHub Container Registry
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up Docker Buildx
         if: needs.changes.outputs.node == 'true'
         uses: docker/setup-buildx-action@v3
@@ -173,14 +183,6 @@ jobs:
           echo "node_version=${NODE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "image_version=${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Session Node package: ${PACKAGE_VERSION}; image: ${IMAGE_VERSION}"
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request' && (needs.changes.outputs.node == 'true' || needs.changes.outputs.manager == 'true')
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate tags
         id: meta
