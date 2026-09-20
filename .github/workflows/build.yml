@@ -41,6 +41,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # paths-filter diffs against the previous push, which a shallow clone may lack
 
       - name: Detect which image inputs changed
         id: filter
