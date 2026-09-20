@@ -20,10 +20,12 @@ env:
 
 jobs:
   # Each image is built and published only when its own inputs changed, so a manager
-  # release never republishes the node image (and vice versa). The node image's build
-  # context is Dockerfile, entrypoint.sh, and healthcheck.sh (see .dockerignore); the
-  # manager image is the manager directory. The weekly schedule exists to pick up new
-  # node packages, so it always rebuilds the node image; a manual run rebuilds both.
+  # release never republishes the node image (and vice versa). The node image's inputs
+  # are its build context (Dockerfile, entrypoint.sh, healthcheck.sh, as selected by
+  # .dockerignore) plus .dockerignore itself and this workflow, which holds the build
+  # recipe and IMAGE_REVISION; the manager image's inputs are the manager directory and
+  # this workflow. The weekly schedule exists to pick up new node packages, so it always
+  # rebuilds the node image; a manual run rebuilds both.
   changes:
     runs-on: ubuntu-latest
     permissions:
