@@ -585,7 +585,13 @@ class Collector:
 
     def run(self):
         while not self.stopping.is_set():
-            wait = self.step()
+            try:
+                wait = self.step()
+            except Exception as error:  # noqa: BLE001 - the thread must outlive any one bad sample
+                # Whatever went wrong with one sample, the dashboard must not silently go stale.
+                print(f'Collector error; continuing: {error!r}', file=sys.stderr, flush=True)
+                self.running = None
+                wait = LISTING_INTERVAL
             if wait is None or wait > 0:
                 self.wake.wait(LISTING_INTERVAL if wait is None else min(wait, LISTING_INTERVAL))
                 self.wake.clear()
@@ -599,9 +605,12 @@ class Collector:
         self.thread = threading.Thread(target=self.run, name='collector', daemon=True)
         self.thread.start()
 
-    def stop(self):
+    def stop(self, timeout=5):
+        """Ask the thread to finish and wait for it, bounded so a stalled probe cannot hold shutdown."""
         self.stopping.set()
         self.wake.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout)
 
     @property
     def filled(self):
@@ -893,7 +902,7 @@ class Manager:
         self.collector.invalidate(('node', name))
         query = '' if action == 'start' else f'?t={STOP_TIMEOUT}'
         self.docker.request('POST', f'/containers/{container_id}/{action}{query}', timeout=STOP_TIMEOUT + 30)
-        return self.refresh(name, invalidate=True)[1]
+        return self.refresh(name, invalidate=True)
 
     def register(self, name, operator_address, submit):
         container_id, details = self.locate(name)
@@ -989,10 +998,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.read_body()
         if body is None:
             return
-        if action in ('restart', 'stop', 'start'):
-            return self.send(200, self.manager.power(name, action))
-        if action == 'refresh':
-            finished, node = self.manager.refresh(name)
+        if action in ('restart', 'stop', 'start', 'refresh'):
+            finished, node = self.manager.refresh(name) if action == 'refresh' else self.manager.power(name, action)
+            # 202 says the action is done but its sample has not landed yet (sample.pending is true).
             return self.send(200 if finished else 202, node)
         if action == 'register':
             address, submit = body.get('operator_address'), body.get('submit', False)

@@ -332,6 +332,15 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.probes(), ['oxen00'])  # the action's own sample, and nothing else
         self.assertEqual(self.mutate('/api/nodes/stagenet00/start')[0], 200)
         self.assertIn(('start', 'stagenet00.container', ''), FakeDocker.calls)
+        # An action whose sample has not landed by the time the request must answer is reported as 202.
+        original = manager.REFRESH_WAIT
+        manager.REFRESH_WAIT = 0
+        try:
+            status, payload = self.mutate('/api/nodes/oxen00/restart')
+            self.assertEqual((status, payload['name']), (202, 'oxen00'))
+        finally:
+            manager.REFRESH_WAIT = original
+        self.assertEqual(self.mutate('/api/nodes/oxen00/refresh')[0], 200)  # and 200 once it has
         self.assertEqual(self.request('/api/nodes')[1]['nodes'][1]['sample']['status'], 'ok')
 
     def test_register(self):

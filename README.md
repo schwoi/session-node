@@ -370,7 +370,9 @@ on the same thread, so it cannot overlap the scheduled round; requests for a
 node that is already queued or being sampled share that one sample; and a
 request that follows a finished sample of the same node by less than 30 seconds
 is refused with HTTP 429 and a `retry_after`. Restart, stop, and start use the
-same path: the response is the sample taken after the action, and a sample that
+same path: the response is the sample taken after the action (HTTP 202 instead
+of 200 in the rare case that sample is still pending when the request times
+out, with `sample.pending` set), and a sample that
 was already running when the action began is discarded rather than allowed to
 overwrite the newer state. The same rule protects against a probe that started
 in a container instance which has since been recreated.
