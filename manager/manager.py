@@ -553,6 +553,8 @@ class Collector:
                 self.excluded.add(entry.container_id)
         except (DockerError, OSError, KeyError, ValueError) as failure:
             error = str(failure)
+        except Exception as failure:  # noqa: BLE001 - a bug in one sample must not take the thread down
+            error = f'unexpected {failure!r}'
         with self.lock:
             self.running = None
             current = self.entries.get(key)
@@ -587,14 +589,29 @@ class Collector:
         while not self.stopping.is_set():
             try:
                 wait = self.step()
-            except Exception as error:  # noqa: BLE001 - the thread must outlive any one bad sample
-                # Whatever went wrong with one sample, the dashboard must not silently go stale.
+            except Exception as error:  # noqa: BLE001 - the thread must outlive any one bad round
+                # Whatever went wrong, the dashboard must not silently go stale.
                 print(f'Collector error; continuing: {error!r}', file=sys.stderr, flush=True)
-                self.running = None
+                self.abandon()
                 wait = LISTING_INTERVAL
             if wait is None or wait > 0:
                 self.wake.wait(LISTING_INTERVAL if wait is None else min(wait, LISTING_INTERVAL))
                 self.wake.clear()
+
+    def abandon(self):
+        """Release whoever waits on a sample that step() could not finish; the entry stays pending.
+
+        The schedule is untouched, so the next scheduled or requested sample answers for it.
+        """
+        with self.lock:
+            running, self.running = self.running, None
+            if running is None:
+                return
+            key, ticket, _ = running
+            entry = self.entries.get(key)
+            if entry is not None:
+                entry.pending = True
+        ticket.resolve()
 
     def start(self):
         """Plan once so every service is listed as pending before the first request, then sample."""

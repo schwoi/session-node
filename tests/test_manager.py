@@ -653,6 +653,37 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual((node['state'], node['sample']['status'], node['sample']['pending'], node['sample']['age']),
                          ('pending', 'pending', True, None))
 
+    def test_unexpected_errors_do_not_strand_waiters(self):
+        mgr, collector, clock = self.collector()
+        self.fill(collector)
+        key = ('node', 'oxen00')
+        clock.advance(31)
+        # A bug while sampling is recorded as a failed sample; the waiter is answered, the thread lives on.
+        original = mgr.inspect
+        mgr.inspect = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('boom'))
+        try:
+            ticket = collector.request(key)
+            self.assertEqual(collector.step(), 0)
+        finally:
+            mgr.inspect = original
+        self.assertTrue(ticket.event.is_set())
+        node = collector.view(key)
+        self.assertEqual((node['state'], node['sample']['status'], node['sample']['pending']), ('degraded', 'failed', False))
+        self.assertIn("unexpected RuntimeError('boom')", node['sample']['error'])
+        # If step() itself dies mid-sample, abandon() releases the waiter and leaves the entry pending
+        # for the next sample instead of dropping the ticket.
+        clock.advance(31)
+        ticket = collector.request(key)
+        collector.forced.pop(key)
+        collector.running = (key, ticket, collector.entries[key].epoch)
+        collector.abandon()
+        self.assertTrue(ticket.event.is_set())
+        self.assertIsNone(collector.running)
+        self.assertTrue(collector.view(key)['sample']['pending'])
+        collector.abandon()  # nothing running: harmless
+        self.assertEqual(collector.step(), 0)  # the scheduled sample then clears the pending flag
+        self.assertFalse(collector.view(key)['sample']['pending'])
+
     def test_listing_failure_is_retried_without_touching_the_cache(self):
         mgr, collector, clock = self.collector()
         self.fill(collector)
