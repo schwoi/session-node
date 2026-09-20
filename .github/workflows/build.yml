@@ -42,7 +42,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # paths-filter diffs against the previous push, which a shallow clone may lack
+          # paths-filter diffs against the previous push, which a shallow clone may lack;
+          # scheduled and manual runs need no history.
+          fetch-depth: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && 0 || 1 }}
 
       - name: Detect which image inputs changed
         id: filter
@@ -124,7 +126,7 @@ jobs:
             docker tag "$image" session-node:local
             echo "built=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::No published node image at $image; building one for the tests"
+            echo "::warning::Could not pull $image (not published yet, or the registry was not reachable); building a node image for the tests"
             docker build --pull -t session-node:local .
             echo "built=true" >> "$GITHUB_OUTPUT"
           fi
