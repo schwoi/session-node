@@ -79,6 +79,7 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
     @classmethod
     def reset(cls):
         cls.calls.clear()
+        cls.execs.clear()
         cls.ids.clear()
         cls.failing.clear()
         cls.hooks.clear()

@@ -303,8 +303,8 @@ port, image and version, identity, and staking state. Actions: logs,
 of selected rows, and registration for staking. The layout targets desktop
 widths; on narrow screens the table scrolls sideways.
 
-Every row carries the age of the sample it shows, next to its status. A
-sample is one of four things: fresh (just its age, for example `3m`),
+Every row carries the age of the sample it shows, next to its status. The tag
+says which kind of sample it is: fresh (just its age, for example `3m`),
 **updating…** (a new sample is queued or running; the row keeps showing the
 previous one meanwhile), **failed** (the last attempt could not read the
 container at all, typically a Docker socket error, so the row keeps the last
