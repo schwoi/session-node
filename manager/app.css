@@ -51,7 +51,7 @@
   --drawer-w: 460px;
 
   /* Wide set sums to 1360; the drawer steals width and drops Peers and Version. */
-  --cols: 32px 248px 92px 170px 88px 96px 84px 272px 118px 160px;
+  --cols: 32px 248px 92px 196px 88px 96px 84px 272px 92px 160px;
 }
 body.drawer-open { --cols: 24px 214px 78px 184px 76px 66px 96px 170px; }
 
@@ -153,7 +153,15 @@ body.drawer-open .thead .col-version { display: none; }
 .row > * { min-width: 0; overflow: hidden; }
 .row .name { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .row .svc { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.row .status { font-size: 12.5px; white-space: nowrap; text-overflow: ellipsis; }
+.row .status { display: flex; align-items: center; gap: 7px; padding-right: 10px; font-size: 12.5px; }
+.row .status .status-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Sample age: how old the row's data is, and whether a newer sample is pending, failed, or overdue. */
+.age { font-size: 10.5px; color: var(--text-4); white-space: nowrap; flex-shrink: 0; }
+.age.is-warn { color: var(--warn); }
+.age.is-bad { color: var(--bad); }
+.age.is-sync { color: var(--sync); animation: age-pulse 1.4s ease-in-out infinite; }
+@keyframes age-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .age.is-sync { animation: none; } }
 .row .num { font-size: 12px; color: var(--text-2); }
 .row .peers { font-size: 12px; color: var(--text-3); }
 .row .version { font-size: 11px; color: var(--text-4); white-space: nowrap; text-overflow: ellipsis; }
@@ -198,6 +206,11 @@ body.drawer-open .drawer { display: flex; }
 .drawer-head .title { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .drawer-head .title .cluster { gap: 9px; }
 .drawer-head .crumb { font-size: 11.5px; color: var(--text-4); }
+.drawer-head .sample { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-3); }
+.drawer-head .sample.is-warn { color: var(--warn); }
+.drawer-head .sample.is-bad { color: var(--bad); }
+.drawer-head .sample.is-sync { color: var(--sync); }
+.drawer-head .sample .btn { margin-left: auto; height: 24px; font-size: 11px; flex-shrink: 0; }
 .drawer-body { flex-grow: 1; overflow-y: auto; padding: 16px 20px 24px; display: flex; flex-direction: column; gap: 16px; }
 .drawer h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
 .alert {
@@ -332,7 +345,7 @@ pre {
     position: fixed; top: 0; right: 0; bottom: 0; z-index: 10; max-width: 100vw;
     box-shadow: -24px 0 48px rgba(0, 0, 0, .5);
   }
-  body.drawer-open { --cols: 32px 248px 92px 170px 88px 96px 84px 272px 118px 160px; }
+  body.drawer-open { --cols: 32px 248px 92px 196px 88px 96px 84px 272px 92px 160px; }
   body.drawer-open .thead .col-peers,
   body.drawer-open .thead .col-version { display: block; }
   body.drawer-open .tablewrap { padding-right: var(--pad-x); }

@@ -4,16 +4,18 @@
    lag). This view only formats, groups, filters, and adds fleet-wide observations
    (version drift, height tip) that need every host at once. */
 
+/* The page re-reads the manager's cache this often. Reads are free: the manager samples
+   nodes on its own schedule, and every row shows how old its sample is. */
 const REFRESH_SECONDS = 15;
-const STATE_TONE = { healthy: 'ok', syncing: 'sync', degraded: 'warn', stopped: 'idle', unknown: 'bad' };
-const STATE_RANK = { unknown: 0, degraded: 1, stopped: 2, syncing: 3, healthy: 4 };
+const STATE_TONE = { healthy: 'ok', syncing: 'sync', degraded: 'warn', stopped: 'idle', unknown: 'bad', pending: 'sync' };
+const STATE_RANK = { unknown: 0, degraded: 1, stopped: 2, syncing: 3, pending: 3, healthy: 4 };
 const HOST_RANK = { bad: 0, warn: 1, ok: 2 };
 
 const state = {
   token: sessionStorage.getItem('manager-token') || '',
   filter: 'attention', search: '', sort: 'problems',
   collapsed: {}, selectedId: null, checked: {}, pending: {}, errors: {},
-  hosts: [], fleet: { tip: 0, version: null },
+  hosts: [], fleet: { tip: 0, version: null }, polling: null,
   timer: null, countdown: REFRESH_SECONDS, generation: 0, busy: false, menuFor: null,
 };
 
@@ -46,10 +48,11 @@ const servicePath = (service) => `${service.base}/${service.name}`;
 /* View model --------------------------------------------------------------- */
 
 function buildHosts(payload) {
-  const local = { name: payload.host, project: payload.project, agent: 'online', base: '/api/nodes', nodes: payload.nodes };
+  const local = { name: payload.host, project: payload.project, agent: 'online', base: '/api/nodes', nodes: payload.nodes, sample: null };
   const peers = (payload.peers || []).map((peer) => ({
     name: peer.host, project: peer.project, agent: peer.error ? 'unreachable' : 'online',
-    error: peer.error, lastSeenAgo: peer.last_seen_ago, base: `/api/hosts/${peer.host}/nodes`, nodes: peer.nodes || [],
+    error: peer.error, lastSeenAgo: peer.last_seen_ago, sample: peer.sample || null,
+    base: `/api/hosts/${peer.host}/nodes`, nodes: peer.nodes || [],
   }));
   const hosts = [local, ...peers].map((host) => ({
     ...host,
@@ -74,7 +77,7 @@ function buildHosts(payload) {
     host.tone = host.agent !== 'online' ? 'bad' : host.attention ? 'warn' : 'ok';
     host.attentionCount = host.services.filter((service) => service.needsAttention).length;
   }
-  return { hosts, fleet: { tip: heights.mainnet || heights.stagenet || 0, version: fleetVersion, heights } };
+  return { hosts, fleet: { tip: heights.mainnet || heights.stagenet || 0, version: fleetVersion, heights }, polling: payload.polling || null };
 }
 
 function toService(node, host) {
@@ -91,7 +94,7 @@ function toService(node, host) {
     identity: info.pubkey || null, serviceNode: info.service_node || null,
     registered: Boolean(info.service_node && info.service_node.registered),
     processes: node.processes || [], problems: node.problems || [], suppressed: node.suppressed || [],
-    sync: node.sync || null,
+    sync: node.sync || null, sample: node.sample || null,
     state: node.state, reason: node.reason, needsAttention: Boolean(node.needs_attention),
   };
   if (node.error) {
@@ -212,6 +215,36 @@ function icon(kind) {
   return svg;
 }
 
+/* Compact age for sample tags: 45s, 6m, 2h. */
+function ageText(seconds) {
+  if (seconds == null) return '—';
+  const total = Math.max(0, Math.floor(seconds));
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m`;
+  return `${Math.floor(total / 3600)}h`;
+}
+
+/* One sample has one freshness: updating (a sample is on its way), failed (the last attempt
+   failed; the data shown is older), stale (the manager missed a round), or simply its age. */
+function sampleInfo(sample) {
+  if (!sample) return null;
+  if (sample.pending) return { tone: 'sync', label: 'updating…', title: sample.age == null ? 'Waiting for the first sample' : `Sample ${ageText(sample.age)} old; a new one is on its way` };
+  if (sample.status === 'failed') {
+    return { tone: 'bad', label: sample.age == null ? 'failed' : `failed · ${ageText(sample.age)}`,
+      title: `Last update failed: ${sample.error || 'unknown error'}${sample.age == null ? '' : `. Showing the sample from ${ageText(sample.age)} ago.`}` };
+  }
+  if (sample.status === 'stale') return { tone: 'warn', label: `stale ${ageText(sample.age)}`, title: `Sampled ${ageText(sample.age)} ago; the manager missed a round` };
+  return { tone: null, label: ageText(sample.age), title: `Sampled ${ageText(sample.age)} ago` };
+}
+
+function sampleTag(sample) {
+  const info = sampleInfo(sample);
+  if (!info) return null;
+  const tag = element('span', `m age${info.tone ? ` is-${info.tone}` : ''}`, info.label);
+  tag.title = info.title;
+  return tag;
+}
+
 const pill = (text, tone) => element('span', `pill${tone ? ` pill--${tone}` : ''}`, text);
 const dot = (tone, extra = '') => element('span', `dot is-${tone}${extra ? ` ${extra}` : ''}`);
 // While a node is still syncing, companions that have not started reporting are expected, not amber.
@@ -315,7 +348,8 @@ function renderTable() {
   tbody.replaceChildren();
   let shownRows = 0;
   for (const host of sortedHosts()) {
-    const rows = host.agent === 'online' ? sortedRows(host) : [];
+    // An unreachable host still lists what it last reported; every row shows how old that is.
+    const rows = sortedRows(host);
     if (!rows.length && host.agent === 'online') continue;
     shownRows += rows.length;
     tbody.append(renderGroup(host, rows, narrow));
@@ -346,7 +380,8 @@ function renderEmpty() {
 }
 
 function renderGroup(host, rows, narrow) {
-  const collapsed = host.agent !== 'online' || Boolean(state.collapsed[host.name]);
+  // Unreachable hosts start collapsed; the operator can still open their last known rows.
+  const collapsed = host.name in state.collapsed ? state.collapsed[host.name] : host.agent !== 'online';
   const group = element('section', `group is-${host.tone}${collapsed ? ' collapsed' : ''}`);
   group.dataset.host = host.name;
 
@@ -362,6 +397,11 @@ function renderGroup(host, rows, narrow) {
     : `agent unreachable · ${host.lastSeenAgo != null ? `last seen ${duration(host.lastSeenAgo)} ago` : 'never seen since start'}`);
   if (host.error) project.title = host.error;
   left.append(project);
+  if (host.sample && host.agent === 'online') {
+    const fetched = element('span', 'm group-project', host.sample.pending ? 'fetching…' : `fetched ${ageText(host.sample.age)} ago`);
+    fetched.title = 'When this manager last fetched the host\'s cached listing';
+    left.append(fetched);
+  }
   const right = element('div', 'right');
   if (host.agent !== 'online') right.append(pill('unreachable', 'bad'));
   else if (host.attention) right.append(pill(`${host.attentionCount} need${host.attentionCount === 1 ? 's' : ''} attention`, 'warn'));
@@ -369,20 +409,20 @@ function renderGroup(host, rows, narrow) {
     const syncing = host.services.filter((service) => service.state === 'syncing').length;
     right.append(pill(`${syncing} syncing · ${host.services.length - syncing} healthy`, 'sync'));
   } else right.append(pill(`${host.services.length} healthy`, 'ok'));
-  if (host.agent !== 'online') right.append(button('Retry', () => refresh()));
+  if (host.agent !== 'online') right.append(button('Retry', () => refreshPeer(host)));
   else right.append(button('Host actions', (event) => openHostMenu(event.currentTarget, host), 'btn', `Actions for host ${host.name}`));
   head.append(left, right);
   const toggle = () => {
-    state.collapsed[host.name] = !state.collapsed[host.name];
+    state.collapsed[host.name] = !collapsed;
     renderTable();
   };
   head.addEventListener('click', (event) => {
-    if (host.agent === 'online' && !event.target.closest('button')) toggle();
+    if (!event.target.closest('button')) toggle();
   });
   head.addEventListener('keydown', (event) => {
     if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('button')) {
       event.preventDefault();
-      if (host.agent === 'online') toggle();
+      toggle();
     }
   });
   group.append(head);
@@ -397,6 +437,7 @@ function badgeFor(service) {
   if (service.state === 'unknown') return pill('unknown', 'bad');
   if (service.state === 'stopped') return pill('stopped');
   if (service.state === 'syncing') return pill('syncing', 'sync');
+  if (service.state === 'pending') return pill('pending', 'sync');
   if (service.needsAttention) return pill('attention', 'warn');
   if (service.role === 'node') return service.registered ? pill('registered', 'ok') : pill('unregistered', 'warn');
   return null;
@@ -432,8 +473,12 @@ function renderRow(service, narrow) {
   network.append(pill(service.network, service.network === 'stagenet' ? 'warn' : null));
   row.append(network);
 
-  const status = element('span', `status is-${tone}${service.actionError ? ' is-error' : ''}`, service.actionError ? `failed: ${service.actionError}` : service.reason || '—');
-  if (service.actionError) status.title = service.actionError;
+  const status = element('div', `status is-${tone}${service.actionError ? ' is-error' : ''}`);
+  const statusText = element('span', 'status-text', service.actionError ? `failed: ${service.actionError}` : service.reason || '—');
+  statusText.title = service.actionError || service.reason || '';
+  status.append(statusText);
+  const tag = sampleTag(service.sample);
+  if (tag) status.append(tag);
   row.append(status);
   row.append(element('span', 'm num', service.running ? duration(service.uptime) : '—'));
   const heightCell = element('span', `m num${service.state === 'syncing' ? ' is-sync' : service.lagging ? ' is-warn' : ''}`,
@@ -465,8 +510,8 @@ function renderRow(service, narrow) {
   if (!narrow) row.append(element('span', `m version${service.versionDrift ? ' is-warn' : ''}`, shortVersion(service.version)));
 
   const actions = element('div', 'actions');
-  if (service.state === 'unknown') {
-    actions.append(button('Retry', () => refresh()));
+  if (service.state === 'unknown' || service.state === 'pending') {
+    actions.append(button('Update now', () => updateNow(service)));
   } else {
     actions.append(button('Logs', () => openLogs(service)));
     if (service.state === 'stopped') actions.append(button('Start', () => power(service, 'start', 'Start'), 'btn btn--primary'));
@@ -546,6 +591,23 @@ function renderDrawer() {
   close.append(icon('close'));
   top.append(title, close);
   head.append(top);
+  const info = sampleInfo(service.sample);
+  if (info) {
+    const line = element('div', `sample${info.tone ? ` is-${info.tone}` : ''}`);
+    const what = service.sample.pending ? (service.sample.age == null ? 'Waiting for the first sample' : `Updating · showing the sample from ${duration(service.sample.age)} ago`)
+      : service.sample.status === 'failed' ? `Last update failed${service.sample.age == null ? '' : ` · showing the sample from ${duration(service.sample.age)} ago`}`
+        : service.sample.status === 'stale' ? `Stale · sampled ${duration(service.sample.age)} ago, the manager missed a round`
+          : `Sampled ${duration(service.sample.age)} ago`;
+    line.append(dot(info.tone || 'idle', 'dot--sm'), element('span', null, what));
+    if (service.sample.status === 'failed' && service.sample.error) line.title = service.sample.error;
+    if (service.state !== 'unknown' || service.sample.status !== 'pending') {
+      const update = button('Update now', () => updateNow(service), 'btn');
+      update.disabled = Boolean(service.sample.pending);
+      line.append(update);
+    }
+    head.append(line);
+    if (service.sample.status === 'failed' && service.sample.error) head.append(element('p', 'suppressed', service.sample.error));
+  }
   if (service.actionError) {
     const alert = element('div', 'alert is-bad');
     alert.append(dot('bad'), element('span', null, `Last action failed: ${service.actionError}`));
@@ -571,7 +633,7 @@ function renderDrawer() {
   drawer.append(head);
 
   const body = element('div', 'drawer-body');
-  if (service.state !== 'unknown') {
+  if (service.state !== 'unknown' && service.state !== 'pending') {
     const actions = element('div', 'actionrow');
     actions.append(button('Logs', () => openLogs(service)));
     if (service.running) {
@@ -688,6 +750,7 @@ function openServiceMenu(anchor, service) {
   } else {
     items.push(['Start', () => power(service, 'start', 'Start')]);
   }
+  items.push(['Update now', () => updateNow(service)]);
   items.push(['Details', () => select(service.id)]);
   openMenu(anchor, items);
 }
@@ -728,6 +791,33 @@ async function runAction(service, action) {
 
 function settlePending() {
   for (const id of Object.keys(state.pending)) delete state.pending[id];
+}
+
+/* Ask the manager to sample this service ahead of its schedule. The manager combines
+   duplicate requests and refuses one that follows a recent sample too closely. */
+async function updateNow(service) {
+  state.pending[service.id] = 'updating…';
+  delete state.errors[service.id];
+  const current = findService(service.id);
+  if (current) current.reason = state.pending[service.id];
+  renderTable();
+  renderDrawer();
+  try {
+    await api(`${servicePath(service)}/refresh`, { method: 'POST' });
+  } catch (error) {
+    state.errors[service.id] = error.message;
+  }
+  await refresh(true);
+}
+
+/* Re-fetch a peer manager's cached listing; this never probes the peer's nodes. */
+async function refreshPeer(host) {
+  try {
+    await api(`/api/hosts/${host.name}/refresh`, { method: 'POST' });
+  } catch (error) {
+    showMessage(error.message);
+  }
+  await refresh(true);
 }
 
 async function bulk(action, ids) {
@@ -864,7 +954,7 @@ async function refresh(force = false) {
     if (force) settlePending();
     Object.assign(state, buildHosts(payload));
     for (const id of Object.keys(state.checked)) if (!findService(id)) delete state.checked[id];
-    $('#updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
+    $('#updated').textContent = `page loaded ${new Date().toLocaleTimeString()}`;
     showMessage('');
     renderAll();
   } catch (error) {
@@ -877,8 +967,9 @@ async function refresh(force = false) {
 
 function tick() {
   const countdown = $('#countdown');
+  const polled = state.polling ? `nodes sampled every ${ageText(state.polling.interval)} · ` : '';
   if (!$('#autorefresh').checked) {
-    countdown.textContent = 'auto-refresh off';
+    countdown.textContent = `${polled}auto-reload off`;
     return;
   }
   state.countdown -= 1;
@@ -886,7 +977,7 @@ function tick() {
     state.countdown = REFRESH_SECONDS;
     refresh();
   }
-  countdown.textContent = `next refresh in ${state.countdown}s`;
+  countdown.textContent = `${polled}page reloads in ${state.countdown}s`;
 }
 
 /* Wiring ------------------------------------------------------------------- */

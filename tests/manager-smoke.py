@@ -62,12 +62,17 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
                                        'L2_PROVIDER': 'http://127.0.0.1:8545'}},
         'manager': {**hardened, 'image': MANAGER_IMAGE, 'read_only': True, 'cap_drop': ['ALL'],
                     'ports': ['127.0.0.1:0:8080/tcp'], 'volumes': [f'{socket_path}:/var/run/docker.sock:ro'],
+                    # Short intervals: the dashboard only ever reads the collector's cache, and
+                    # the nodes take a while to answer RPC, so sample often enough to notice
+                    # (two nodes on 90s means one sample every 45s, leaving room for the 30s cooldown).
                     'environment': {'ROLE': 'manager', 'MANAGER_TOKEN': TOKEN, 'MANAGER_HOST': 'hub',
-                                    'MANAGER_PEERS': 'second=http://peer:8080'}},
+                                    'MANAGER_PEERS': 'second=http://peer:8080',
+                                    'MANAGER_POLL_INTERVAL': '90', 'MANAGER_PEER_INTERVAL': '10'}},
         # A second manager standing in for another server; it happens to see the same project.
         'peer': {**hardened, 'image': MANAGER_IMAGE, 'read_only': True, 'cap_drop': ['ALL'],
                  'volumes': [f'{socket_path}:/var/run/docker.sock:ro'],
-                 'environment': {'ROLE': 'manager', 'MANAGER_TOKEN': TOKEN, 'MANAGER_HOST': 'second'}}}}
+                 'environment': {'ROLE': 'manager', 'MANAGER_TOKEN': TOKEN, 'MANAGER_HOST': 'second',
+                                 'MANAGER_POLL_INTERVAL': '20'}}}}
     (root / 'docker-compose.yml').write_text(json.dumps(config))
 
     def compose(*args, check=True):
@@ -97,14 +102,30 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
             assert status == 200, payload
             nodes = {node['name']: node for node in payload['nodes']}
             assert set(nodes) == {'l2proxy', 'stagenet00'}, list(nodes)  # Managers never list themselves.
-            if all(node.get('node') and node['node']['rpc_ok'] and node['processes'] for node in nodes.values()):
+            peer, = payload['peers']
+            if (all(node.get('node') and node['node']['rpc_ok'] and node['processes'] for node in nodes.values())
+                    and peer['nodes'] and all(node.get('node') and node['node']['rpc_ok'] for node in peer['nodes'])):
                 return payload
             return None
         payload = wait_for('both nodes to answer RPC', ready)
         assert (payload['project'], payload['host']) == (project, 'hub')
+        assert payload['polling'] == {'interval': 90, 'peer_interval': 10, 'cooldown': 30}, payload['polling']
         peer, = payload['peers']
         assert (peer['host'], peer['project']) == ('second', project), peer
         assert sorted(node['name'] for node in peer['nodes']) == ['l2proxy', 'stagenet00'], peer
+        for node in payload['nodes'] + peer['nodes']:
+            sample = node['sample']
+            assert sample['status'] == 'ok' and not sample['pending'] and sample['error'] is None, sample
+            assert isinstance(sample['age'], int) and sample['at'], sample
+        assert peer['sample']['status'] == 'ok' and peer['last_seen_ago'] < 60, peer['sample']
+        # An explicit refresh samples through the collector; a second one right away hits the cooldown.
+        wait_for('the cooldown after the last scheduled sample', lambda: api(base, '/api/nodes/l2proxy')[1]['sample']['age'] >= 31)
+        status, result = api(base, '/api/nodes/l2proxy/refresh', {})
+        assert status == 200 and result['sample']['age'] <= 5 and not result['sample']['pending'], result['sample']
+        status, result = api(base, '/api/nodes/l2proxy/refresh', {})
+        assert status == 429 and 0 < result['retry_after'] <= 30, result
+        status, result = api(base, '/api/hosts/second/nodes/stagenet00/refresh', {})
+        assert status in (200, 429), result  # the peer's own collector applies its own cooldown
         status, result = api(base, '/api/hosts/second/nodes/l2proxy')
         assert status == 200 and result['name'] == 'l2proxy' and result['node']['pubkey'], result
         status, text = api(base, '/api/hosts/second/nodes/l2proxy/logs?tail=20')
@@ -158,7 +179,8 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
         wait_for('stagenet RPC after start', lambda: (api(base, '/api/nodes/stagenet00')[1].get('node') or {}).get('rpc_ok'))
         assert api(base, '/api/nodes/manager')[0] == 404
         assert api(base, '/api/nodes/l2proxy/restart')[0] == 404, 'Actions must not be reachable with GET'
-        print('PASS: project discovery, token auth, RPC probes, identities, logs, CLI status, registration guard rails, restart, stop/start')
+        print('PASS: project discovery, token auth, cached RPC probes, refresh and cooldown, identities, logs, '
+              'CLI status, registration guard rails, restart, stop/start')
     except Exception:
         print(compose('logs', '--tail', '60', check=False), flush=True)
         raise

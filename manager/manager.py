@@ -4,7 +4,6 @@
 Talks to the Docker Engine socket only; node state is read through each node's
 loopback-bound oxend RPC by running a probe inside its container.
 """
-import concurrent.futures
 import hmac
 import http.client
 import http.server
@@ -24,7 +23,7 @@ from datetime import datetime, timezone
 STATIC = Path(__file__).resolve().parent
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
 # Paths that may be forwarded to a peer manager, relative to its /api/ prefix.
-PEER_PATH = re.compile(r'nodes(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/(?:logs|status|print_sn_status|restart|stop|start|register))?)?')
+PEER_PATH = re.compile(r'nodes(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/(?:logs|status|print_sn_status|restart|stop|start|register|refresh))?)?')
 ETH_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 PORT = 8080
@@ -44,9 +43,24 @@ SYNC_MEMORY = 3600
 # Hard ceiling on one probe inside a node container. The probe is killed at this
 # point so a stalled node can never accumulate probe processes across polls.
 PROBE_DEADLINE = 40
-# A finished overview is reused for this long, so several browsers, a peer, and
-# auto-refresh share one probe round instead of each starting their own.
-OVERVIEW_CACHE = 10
+# Seconds between two samples of the same node; MANAGER_POLL_INTERVAL overrides it.
+# Nodes are spread evenly across the interval, and one thread takes every sample in
+# turn, so the probe load on a host is one probe per interval per node, never a burst.
+POLL_INTERVAL = 300
+# Seconds between two fetches of a peer manager's cached listing (MANAGER_PEER_INTERVAL).
+# A peer answers from its own cache, so this is cheap and does not probe its nodes.
+PEER_INTERVAL = 60
+# An explicit "Update now" is refused while the node's last sample is younger than this.
+REFRESH_COOLDOWN = 30
+# How long an explicit refresh waits for the collector before answering with what it has.
+REFRESH_WAIT = PROBE_DEADLINE + 30
+# A peer serves its listing from cache, so it either answers at once or is down.
+PEER_TIMEOUT = 15
+# A failed container listing (Docker socket down) is retried after this many seconds,
+# and an idle collector re-lists containers this often to notice new services.
+LISTING_INTERVAL = 15
+# A sample older than this many intervals is shown as stale: the collector missed a round.
+STALE_ROUNDS = 2
 # How recent oxend's own "Synced H/T" log line must be to count as current progress.
 SYNC_LOG_FRESH = 600
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
@@ -337,6 +351,316 @@ class NotFound(Exception):
     pass
 
 
+class Cooldown(Exception):
+    """An explicit refresh arrived too soon after the last sample."""
+
+    def __init__(self, age, retry_after):
+        super().__init__(f'sampled {age}s ago; next update allowed in {retry_after}s')
+        self.retry_after = retry_after
+
+
+class Ticket:
+    """Completion of one requested sample; every duplicate request shares the same ticket."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.followers = []  # tickets whose sample was discarded and superseded by this one
+
+    def resolve(self):
+        self.event.set()
+        for ticket in self.followers:
+            ticket.resolve()
+
+    def wait(self, timeout):
+        return self.event.wait(timeout)
+
+
+class Entry:
+    """What the collector knows about one node or one peer."""
+
+    def __init__(self, key, container_id=None):
+        self.key = key
+        self.container_id = container_id
+        self.epoch = 0  # bumped whenever a sample already in flight must not be trusted
+        self.pending = True  # a sample is queued or running
+        self.data = None  # last successful sample: a node summary, or a peer's listing
+        self.error = None  # why the last attempt failed, or None
+        self.ok_at = None  # monotonic start of the last successful sample
+        self.attempt_at = None  # monotonic start of the last finished attempt
+        self.sampled_at = None  # wall-clock time of the last successful sample
+
+
+class Collector:
+    """One serial background thread that samples nodes and peers on a staggered schedule.
+
+    Every dashboard read is served from the entries kept here, so nothing a browser does
+    starts a probe or a peer request. Explicit refreshes and the sample after an action
+    go through the same thread: two probes never overlap, duplicate requests share one
+    sample, and a schedule that fell behind takes one sample per node, not the missed ones.
+    """
+
+    def __init__(self, manager, interval=POLL_INTERVAL, peer_interval=PEER_INTERVAL,
+                 cooldown=REFRESH_COOLDOWN, clock=time.monotonic):
+        self.manager = manager
+        self.intervals = {'node': interval, 'peer': peer_interval}
+        self.cooldown = cooldown
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.stopping = threading.Event()
+        self.thread = None
+        self.entries = {}  # key -> Entry; key is ('node', service) or ('peer', host)
+        self.due = {}  # key -> monotonic time of the next scheduled sample
+        self.origin = {}  # kind -> monotonic time the current stagger was laid out
+        self.order = {}  # kind -> keys in slot order
+        self.forced = {}  # key -> Ticket, in request order, ahead of the schedule
+        self.running = None  # (key, ticket, epoch) while a sample is being taken
+        self.excluded = set()  # container ids that are managers, never sampled
+
+    # -- schedule -----------------------------------------------------------------
+
+    def plan(self):
+        """Discover nodes and peers; lay the stagger out again when the set changes."""
+        listing = self.manager.containers()
+        fresh = {}
+        for name, container_id in sorted(listing.items()):
+            if container_id in self.excluded:
+                continue
+            with self.lock:
+                entry = self.entries.get(('node', name))
+            if entry is None or entry.container_id != container_id:
+                try:
+                    self.manager.details(name, container_id)
+                except NotFound:  # another manager: never sampled, never listed
+                    self.excluded.add(container_id)
+                    continue
+            fresh[('node', name)] = container_id
+        for host in self.manager.peers:
+            fresh[('peer', host)] = None
+        now = self.clock()
+        with self.lock:
+            changed = set()
+            for key in [key for key in self.entries if key not in fresh]:
+                self.entries.pop(key)
+                self.due.pop(key, None)
+                ticket = self.forced.pop(key, None)
+                if ticket:
+                    ticket.resolve()
+                changed.add(key[0])
+            for key, container_id in fresh.items():
+                entry = self.entries.get(key)
+                if entry is None:
+                    self.entries[key] = Entry(key, container_id)
+                    self.due[key] = now  # a first sample does not wait for its slot
+                    changed.add(key[0])
+                elif entry.container_id != container_id:
+                    # Recreated service: whatever a running probe of the old container
+                    # returns is outdated, and the new one is sampled right away.
+                    entry.container_id, entry.pending = container_id, True
+                    entry.epoch += 1
+                    self.due[key] = now
+            for kind in changed:
+                self.stagger(kind, now)
+            self.excluded &= set(listing.values())
+        self.manager.forget_stale(set(listing.values()))
+
+    def stagger(self, kind, now):
+        """Give every key of a kind an even slot across its interval, starting now."""
+        self.origin[kind] = now
+        self.order[kind] = sorted(key for key in self.entries if key[0] == kind)
+        for key in self.order[kind]:
+            if self.entries[key].attempt_at is not None and not self.entries[key].pending:
+                self.due[key] = self.next_slot(key, now)
+
+    def next_slot(self, key, now):
+        """The key's first slot after now; slots missed while busy are skipped, not caught up."""
+        kind = key[0]
+        keys, interval = self.order[kind], self.intervals[kind]
+        base = self.origin[kind] + (keys.index(key) + 1) * interval / len(keys)
+        if now < base:
+            return base
+        return base + (int((now - base) // interval) + 1) * interval
+
+    # -- requests -----------------------------------------------------------------
+
+    def request(self, key, invalidate=False):
+        """Queue a sample ahead of the schedule and return its ticket.
+
+        Duplicate requests join the queued or running sample. A plain request is refused
+        with Cooldown while the last sample is recent; invalidate=True is for callers that
+        changed the node themselves (start, stop, restart): it always samples afresh and
+        discards any sample that was already in flight.
+        """
+        with self.lock:
+            known = key in self.entries
+        if not known:
+            self.plan()  # a service created moments ago may not have been listed yet
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry is None:
+                raise NotFound(f'No {key[0]} named {key[1]}')
+            if invalidate:
+                entry.epoch += 1
+            ticket = self.forced.get(key)
+            if ticket is None and self.running and self.running[0] == key and self.running[2] == entry.epoch:
+                ticket = self.running[1]
+            if ticket is None:
+                if not invalidate and entry.attempt_at is not None:
+                    age = self.clock() - entry.attempt_at
+                    if age < self.cooldown:
+                        raise Cooldown(int(age), int(self.cooldown - age) + 1)
+                ticket = self.forced[key] = Ticket()
+            entry.pending = True
+        self.wake.set()
+        return ticket
+
+    def invalidate(self, key):
+        """Mark any sample of this key that is in flight as outdated."""
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry:
+                entry.epoch += 1
+
+    # -- sampling -----------------------------------------------------------------
+
+    def step(self):
+        """Take the next requested or due sample. Returns seconds until the next one is due."""
+        try:
+            self.plan()
+        except (DockerError, OSError) as error:
+            print(f'Container listing failed; retrying in {LISTING_INTERVAL}s: {error}', file=sys.stderr, flush=True)
+            return LISTING_INTERVAL
+        now = self.clock()
+        with self.lock:
+            key = next(iter(self.forced), None)
+            if key is None:
+                due = [(when, key) for key, when in self.due.items() if when <= now]
+                if not due:
+                    return max(0.0, min(self.due.values()) - now) if self.due else None
+                key = min(due)[1]
+            entry = self.entries[key]
+            ticket = self.forced.pop(key, None) or Ticket()
+            entry.pending = True
+            epoch = entry.epoch
+            self.running = (key, ticket, epoch)
+        started, wall = self.clock(), datetime.now(timezone.utc)
+        data = error = None
+        try:
+            data = self.sample(key, entry.container_id)
+        except NotFound:
+            # The service stopped being a node (or vanished); the next plan drops it.
+            if entry.container_id:
+                self.excluded.add(entry.container_id)
+        except (DockerError, OSError, KeyError, ValueError) as failure:
+            error = str(failure)
+        with self.lock:
+            self.running = None
+            current = self.entries.get(key)
+            if current is not None and current.epoch != epoch:
+                # The container was replaced or acted on while this sample ran, so the
+                # result is outdated. Drop it and let the newer sample answer the waiters.
+                newer = self.forced.get(key)
+                if newer is None:
+                    self.forced[key] = ticket
+                else:
+                    newer.followers.append(ticket)
+                return 0
+            if current is not None:
+                current.pending = key in self.forced
+                current.attempt_at = started
+                if error is None and data is not None:
+                    current.data, current.error, current.ok_at, current.sampled_at = data, None, started, wall
+                elif error is not None:
+                    current.error = error
+                    print(f'Sample of {key[1]} failed: {error}', file=sys.stderr, flush=True)
+                self.due[key] = self.next_slot(key, self.clock())
+        ticket.resolve()
+        return 0
+
+    def sample(self, key, container_id):
+        kind, name = key
+        if kind == 'node':
+            return self.manager.inspect(name, container_id)
+        return self.manager.fetch_peer(name)
+
+    def run(self):
+        while not self.stopping.is_set():
+            wait = self.step()
+            if wait is None or wait > 0:
+                self.wake.wait(LISTING_INTERVAL if wait is None else min(wait, LISTING_INTERVAL))
+                self.wake.clear()
+
+    def start(self):
+        self.thread = threading.Thread(target=self.run, name='collector', daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stopping.set()
+        self.wake.set()
+
+    @property
+    def filled(self):
+        """True once every known node and peer has been attempted at least once."""
+        with self.lock:
+            return all(entry.attempt_at is not None for entry in self.entries.values())
+
+    # -- views --------------------------------------------------------------------
+
+    def view(self, key):
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry is None:
+                raise NotFound(f'No {key[0]} named {key[1]}')
+            return self.describe(entry, self.clock())
+
+    def views(self, kind):
+        with self.lock:
+            now = self.clock()
+            return [self.describe(entry, now) for key, entry in sorted(self.entries.items()) if key[0] == kind]
+
+    def describe(self, entry, now):
+        """The API view of an entry: its last data plus how fresh that is."""
+        kind, name = entry.key
+        age = None if entry.ok_at is None else int(now - entry.ok_at)
+        if entry.data is None:
+            status = 'failed' if entry.error else 'pending'
+        elif entry.error:
+            status = 'failed'
+        else:
+            status = self.freshness(kind, age)
+        sample = {'age': age, 'status': status, 'error': entry.error, 'pending': entry.pending,
+                  'at': entry.sampled_at.isoformat() if entry.sampled_at else None}
+        if kind == 'node':
+            if entry.data is not None:
+                view = dict(entry.data)
+            elif entry.error:
+                view = {'name': name, 'error': entry.error}
+            else:
+                view = {'name': name, 'state': 'pending', 'reason': 'waiting for the first sample',
+                        'needs_attention': False}
+            return {**view, 'sample': sample}
+        data = entry.data or {}
+        nodes = []
+        for node in data.get('nodes') or []:
+            node = dict(node)
+            reported = dict(node.get('sample') or {})
+            # The peer's sample was already this old when it was fetched.
+            if reported.get('age') is not None and age is not None:
+                reported['age'] += age
+                if reported.get('status') == 'ok':
+                    reported['status'] = self.freshness('node', reported['age'])
+            node['sample'] = reported
+            nodes.append(node)
+        view = {'host': name, 'project': data.get('project'), 'nodes': nodes, 'sample': sample,
+                'last_seen_ago': age}
+        if entry.error:
+            view['error'] = f'{self.manager.peers.get(name, name)}: {entry.error}'
+        return view
+
+    def freshness(self, kind, age):
+        return 'stale' if age is not None and age >= STALE_ROUNDS * self.intervals[kind] else 'ok'
+
+
 def parse_peers(value):
     """MANAGER_PEERS: comma or newline separated name=http(s)://host:port entries."""
     peers = {}
@@ -354,19 +678,18 @@ def parse_peers(value):
 
 
 class Manager:
-    def __init__(self, docker, project, own_service, host='local', peers=None, token=''):
+    def __init__(self, docker, project, own_service, host='local', peers=None, token='',
+                 interval=POLL_INTERVAL, peer_interval=PEER_INTERVAL):
         self.docker = docker
         self.project = project
         self.own_service = own_service
         self.host = host
         self.peers = peers or {}
         self.token = token
-        self.peer_seen = {}  # host -> monotonic time of the last successful overview
         self.probe_locks = {}  # container id -> lock held while its probe runs
         self.state_lock = threading.Lock()  # guards sync_memory and probe_locks themselves
-        self.overview_lock = threading.Lock()
-        self.overview_cache = (0.0, None)  # (monotonic time, result) of the last local listing
         self.sync_memory = {}  # container id -> last (height, target, monotonic time) seen while syncing
+        self.collector = Collector(self, interval, peer_interval)
 
     def containers(self):
         filters = urllib.parse.quote(json.dumps({'label': [f'com.docker.compose.project={self.project}']}))
@@ -474,7 +797,12 @@ class Manager:
         return None
 
     def probe(self, container_id):
-        """Run the probe with a hard deadline, and never more than once per container at a time."""
+        """Run the probe with a hard deadline, and never more than once per container at a time.
+
+        Returns None when the probe ran but the node did not answer: that is an
+        observation about the node. A Docker or socket failure is not, and propagates so
+        the sample is recorded as failed and the last good one stays on the dashboard.
+        """
         with self.state_lock:
             lock = self.probe_locks.setdefault(container_id, threading.Lock())
         if not lock.acquire(blocking=False):
@@ -490,26 +818,12 @@ class Manager:
             if code == 0:
                 return json.loads(stdout)
             reason = 'killed at the deadline' if code == 137 else f'exit code {code}: {output.strip()[-300:]}'
-        except (DockerError, OSError, ValueError) as error:
+        except ValueError as error:  # the probe printed something that is not JSON
             reason = str(error)
         finally:
             lock.release()
         print(f'Probe of container {container_id[:12]} failed; {reason}', file=sys.stderr, flush=True)
         return None
-
-    def nodes(self):
-        containers = self.containers()
-        self.forget_stale(set(containers.values()))
-
-        def one(item):
-            try:
-                return self.inspect(*item)
-            except NotFound:
-                return None
-            except (DockerError, OSError, KeyError) as error:
-                return {'name': item[0], 'error': str(error)}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            return sorted(filter(None, pool.map(one, containers.items())), key=lambda node: node['name'])
 
     def forget_stale(self, current):
         """Drop per-container state for containers that no longer exist (recreated services)."""
@@ -520,41 +834,34 @@ class Manager:
                 if not lock.locked():  # a running probe keeps its lock until it finishes
                     self.probe_locks.pop(container_id, None)
 
-    def local_nodes(self):
-        """The local listing, computed at most once per OVERVIEW_CACHE seconds.
-
-        Callers that arrive while a round is running wait for that round rather than
-        starting another, so the probe rate is bounded by the poll interval no matter
-        how many browsers or peers are asking.
-        """
-        with self.overview_lock:
-            stamp, cached = self.overview_cache
-            if cached is not None and time.monotonic() - stamp < OVERVIEW_CACHE:
-                return cached
-            result = self.nodes()
-            self.overview_cache = (time.monotonic(), result)
-            return result
-
     def overview(self, include_peers=True):
-        """Local nodes plus one entry per peer manager, fetched concurrently."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            local = pool.submit(self.local_nodes)
-            peers = list(pool.map(self.peer_overview, self.peers)) if include_peers else []
-            return {'host': self.host, 'project': self.project, 'nodes': local.result(), 'peers': peers}
+        """Local nodes plus one entry per peer manager, entirely from the collector's cache."""
+        collector = self.collector
+        return {'host': self.host, 'project': self.project,
+                'polling': {'interval': collector.intervals['node'], 'peer_interval': collector.intervals['peer'],
+                            'cooldown': collector.cooldown},
+                'nodes': collector.views('node'), 'peers': collector.views('peer') if include_peers else []}
 
-    def peer_overview(self, host):
-        try:
-            # Peers answer for their own nodes only, so two hubs listing each other never recurse.
-            status, _, payload = self.forward(host, 'GET', 'nodes?peers=0', timeout=PROBE_DEADLINE + 20)
-            data = json.loads(payload)
-            if status != 200 or not isinstance(data, dict):
-                raise ValueError(data.get('error') if isinstance(data, dict) else f'HTTP {status}')
-            self.peer_seen[host] = time.monotonic()
-            return {'host': host, 'project': data.get('project'), 'nodes': data.get('nodes') or []}
-        except (OSError, ValueError) as error:
-            seen = self.peer_seen.get(host)
-            return {'host': host, 'project': None, 'nodes': [], 'error': f'{self.peers[host]}: {error}',
-                    'last_seen_ago': int(time.monotonic() - seen) if seen is not None else None}
+    def node(self, name):
+        """One node's cached sample."""
+        return self.collector.view(('node', name))
+
+    def refresh(self, name, invalidate=False):
+        """Sample a node ahead of schedule; returns (finished, view)."""
+        ticket = self.collector.request(('node', name), invalidate)
+        return ticket.wait(REFRESH_WAIT), self.node(name)
+
+    def refresh_peer(self, host, invalidate=False):
+        ticket = self.collector.request(('peer', host), invalidate)
+        return ticket.wait(PEER_TIMEOUT + 5), self.collector.view(('peer', host))
+
+    def fetch_peer(self, host):
+        """A peer's cached listing. Peers answer for their own nodes only, so hubs never recurse."""
+        status, _, payload = self.forward(host, 'GET', 'nodes?peers=0', timeout=PEER_TIMEOUT)
+        data = json.loads(payload)
+        if status != 200 or not isinstance(data, dict):
+            raise ValueError(data.get('error') if isinstance(data, dict) else f'HTTP {status}')
+        return {'project': data.get('project'), 'nodes': data.get('nodes') or []}
 
     def forward(self, host, method, path, body=None, timeout=STOP_TIMEOUT + 60):
         """Relay an API call to a peer manager using this manager's own token."""
@@ -576,16 +883,18 @@ class Manager:
 
     def power(self, name, action):
         container_id, _ = self.locate(name)
+        # A sample taken while the container changes must not land in the cache; the one
+        # taken after the action is what the dashboard shows next.
+        self.collector.invalidate(('node', name))
         query = '' if action == 'start' else f'?t={STOP_TIMEOUT}'
         self.docker.request('POST', f'/containers/{container_id}/{action}{query}', timeout=STOP_TIMEOUT + 30)
-        return self.inspect(name, container_id)
+        return self.refresh(name, invalidate=True)[1]
 
     def register(self, name, operator_address, submit):
         container_id, details = self.locate(name)
-        summary = self.inspect(name, container_id, details)
-        if summary['role'] != 'node':
+        if details['env'].get('ROLE', 'node') != 'node':
             raise ValueError('Only node services can be registered')
-        if summary['container']['state'] != 'running':
+        if not details['State'].get('Running'):
             raise ValueError('Start the node before registering it')
         command = OXEND + ['register', operator_address] + ([] if submit else ['print'])
         code, _, output = self.docker.exec(container_id, command, timeout=90)
@@ -663,7 +972,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name, action = parts[1], parts[2] if len(parts) > 2 else None
         if method == 'GET':
             if action is None:
-                return self.send(200, self.manager.inspect(name, *self.manager.locate(name)))
+                return self.send(200, self.manager.node(name))
             if action == 'logs':
                 tail = query.get('tail', ['200'])[0]
                 if not tail.isdecimal() or not 1 <= int(tail) <= 5000:
@@ -677,6 +986,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if action in ('restart', 'stop', 'start'):
             return self.send(200, self.manager.power(name, action))
+        if action == 'refresh':
+            finished, node = self.manager.refresh(name)
+            return self.send(200 if finished else 202, node)
         if action == 'register':
             address, submit = body.get('operator_address'), body.get('submit', False)
             if not isinstance(address, str) or not ETH_ADDRESS.fullmatch(address):
@@ -705,7 +1017,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def relay(self, method, parts, query):
         """Forward /api/hosts/<host>/nodes... to that peer manager."""
         host, path = (parts[0] if parts else ''), '/'.join(parts[1:])
-        if host not in self.manager.peers or not PEER_PATH.fullmatch(path):
+        if host not in self.manager.peers or not (PEER_PATH.fullmatch(path) or path == 'refresh'):
             return self.send(404, {'error': 'Not found'})
         body = None
         if method == 'POST':
@@ -713,12 +1025,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if body is None:
                 return
             body = json.dumps(body).encode()
+        if path == 'refresh':
+            if method != 'POST':
+                return self.send(404, {'error': 'Not found'})
+            finished, peer = self.manager.refresh_peer(host)
+            return self.send(200 if finished else 202, peer)
+        action = path.rsplit('/', 1)[-1]
         if query:
             path += '?' + query
         try:
             status, content_type, payload = self.manager.forward(host, method, path, body)
         except OSError as error:
             return self.send(502, {'error': f'Peer {host} unreachable: {error}'})
+        if method == 'POST' and status == 200 and action in ('restart', 'stop', 'start', 'refresh'):
+            # The peer just re-sampled that node; pick the result up before answering so the
+            # dashboard's next read shows it. The action itself succeeded, so this is best effort.
+            try:
+                self.manager.refresh_peer(host, invalidate=True)
+            except (NotFound, DockerError, OSError) as error:
+                print(f'Peer {host} could not be re-fetched after {action}: {error}', file=sys.stderr, flush=True)
         return self.send(status, payload, content_type)
 
     def handle_method(self, method):
@@ -728,6 +1053,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(404, {'error': str(error)})
         except ValueError as error:
             self.send(400, {'error': str(error)})
+        except Cooldown as error:
+            self.send(429, {'error': str(error), 'retry_after': error.retry_after})
         except DockerError as error:
             self.send(502, {'error': f'Docker: {error}'})
         except OSError as error:
@@ -767,16 +1094,28 @@ def main():
     host = os.environ.get('MANAGER_HOST') or 'local'
     if not NAME.fullmatch(host):
         sys.exit('MANAGER_HOST must be a short name of letters, digits, dots, dashes, or underscores')
+    intervals = {}
+    for variable, default in (('MANAGER_POLL_INTERVAL', POLL_INTERVAL), ('MANAGER_PEER_INTERVAL', PEER_INTERVAL)):
+        value = os.environ.get(variable) or str(default)
+        if not value.isdecimal() or int(value) < 10:
+            sys.exit(f'{variable} must be a whole number of seconds, at least 10')
+        intervals[variable] = int(value)
     # Always port 8080 inside the container; Compose chooses the host address and port.
     server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-    server.manager = Manager(docker, project, service, host, peers, token)
+    server.manager = Manager(docker, project, service, host, peers, token,
+                             intervals['MANAGER_POLL_INTERVAL'], intervals['MANAGER_PEER_INTERVAL'])
     print(f'Managing Compose project {project} as host {host} on container port {PORT}', flush=True)
+    print(f"Sampling each node every {intervals['MANAGER_POLL_INTERVAL']}s and each peer every "
+          f"{intervals['MANAGER_PEER_INTERVAL']}s; dashboard reads are served from cache", flush=True)
     for name, url in peers.items():
         print(f'Peer {name}: {url}', flush=True)
+    server.manager.collector.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        server.manager.collector.stop()
 
 
 if __name__ == '__main__':

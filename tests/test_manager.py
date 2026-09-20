@@ -7,6 +7,7 @@ from pathlib import Path
 import socketserver
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -55,9 +56,32 @@ def frames(*chunks):
     return b''.join(bytes([kind, 0, 0, 0]) + len(data).to_bytes(4, 'big') + data for kind, data in chunks)
 
 
+class FakeClock:
+    """A monotonic clock the scheduling tests move by hand."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def now(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
 class FakeDocker(http.server.BaseHTTPRequestHandler):
     calls = []
     execs = {}
+    ids = {}  # service -> container id, when a test recreates a container
+    failing = set()  # services whose probe fails with a Docker error; '*' fails the listing
+    hooks = {}  # service -> callable run while its probe is being created
+
+    @classmethod
+    def reset(cls):
+        cls.calls.clear()
+        cls.ids.clear()
+        cls.failing.clear()
+        cls.hooks.clear()
 
     def log_message(self, *args):
         pass
@@ -81,9 +105,11 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
         if url.path == '/_ping':
             return self.reply(200, b'OK', 'text/plain')
         if url.path == '/containers/json':
+            if '*' in self.failing:
+                return self.reply(500, {'message': 'daemon unavailable'})
             filters = json.loads(urllib.parse.parse_qs(url.query)['filters'][0])
             assert filters == {'label': [f'com.docker.compose.project={PROJECT}']}, filters
-            listing = [{'Id': f'{name}.container', 'Labels': {
+            listing = [{'Id': self.ids.get(name, f'{name}.container'), 'Labels': {
                 'com.docker.compose.project': PROJECT, 'com.docker.compose.service': name}}
                 for name in CONTAINERS]
             listing.append({'Id': 'id-other', 'Labels': {'com.docker.compose.project': 'elsewhere',
@@ -120,6 +146,10 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
             self.calls.append(('exec', name, command))
             stderr = b''
             if 'bash' in command and PROBE_MARKER in command[-1]:
+                if name in self.hooks:
+                    self.hooks[name]()
+                if name in self.failing:
+                    return self.reply(500, {'message': f'exec in {name} refused'})
                 # The probe must run in its own process group under a hard deadline.
                 assert command[:2] == ['setsid', '-w'] and command[2] == 'timeout' and 'KILL' in command, command
                 output, code = json.dumps(PROBES[name]).encode(), 0
@@ -153,26 +183,61 @@ class ManagerTests(unittest.TestCase):
         cls.socket_path = str(Path(cls.temp.name) / 'docker.sock')
         cls.fake = UnixServer(cls.socket_path, FakeDocker)
         threading.Thread(target=cls.fake.serve_forever, daemon=True).start()
+        # Long intervals: only the first round and explicit refreshes sample during the tests.
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), manager.Handler)
-        cls.server.manager = manager.Manager(manager.Docker(cls.socket_path), PROJECT, 'manager')
+        cls.server.manager = manager.Manager(manager.Docker(cls.socket_path), PROJECT, 'manager',
+                                             interval=3600, peer_interval=3600)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.base = f'http://127.0.0.1:{cls.server.server_port}'
         # A second manager instance acting as a remote host on the mesh.
         cls.peer = http.server.ThreadingHTTPServer(('127.0.0.1', 0), manager.Handler)
-        cls.peer.manager = manager.Manager(manager.Docker(cls.socket_path), PROJECT, 'manager', host='remote', token='secret')
+        cls.peer.manager = manager.Manager(manager.Docker(cls.socket_path), PROJECT, 'manager', host='remote',
+                                           token='secret', interval=3600, peer_interval=3600)
         threading.Thread(target=cls.peer.serve_forever, daemon=True).start()
+        for server in (cls.server, cls.peer):
+            server.manager.collector.cooldown = 0  # the cooldown has its own tests
+            server.manager.collector.start()
+        deadline = time.monotonic() + 30
+        while not (cls.server.manager.collector.filled and cls.peer.manager.collector.filled):
+            assert time.monotonic() < deadline, 'first sampling round did not finish'
+            time.sleep(0.05)
 
     @classmethod
     def tearDownClass(cls):
+        cls.server.manager.collector.stop()
+        cls.peer.manager.collector.stop()
         cls.server.shutdown()
         cls.peer.shutdown()
         cls.fake.shutdown()
         cls.temp.cleanup()
 
     def setUp(self):
-        FakeDocker.calls.clear()
+        FakeDocker.reset()
         self.server.manager.token = ''
         self.server.manager.peers = {}
+
+    def tearDown(self):
+        FakeDocker.reset()
+
+    def collector(self, peers=None, interval=300, peer_interval=60, cooldown=30):
+        """A manager whose collector is stepped by hand against a clock the test controls."""
+        mgr = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager', token='secret', peers=peers)
+        clock = FakeClock()
+        mgr.collector = manager.Collector(mgr, interval, peer_interval, cooldown, clock=clock.now)
+        return mgr, mgr.collector, clock
+
+    @staticmethod
+    def probes(name=None):
+        return [call[1] for call in FakeDocker.calls if call[0] == 'exec' and PROBE_MARKER in call[2][-1]
+                and (name is None or call[1] == name)]
+
+    @staticmethod
+    def fill(collector):
+        """Run the collector until nothing is due; returns the names sampled, in order."""
+        before = len(FakeDocker.calls)
+        while collector.step() == 0:
+            pass
+        return [call[1] for call in FakeDocker.calls[before:] if call[0] == 'exec']
 
     def request(self, path, body=None, headers=None, method=None):
         data = json.dumps(body).encode() if body is not None else None
@@ -235,8 +300,13 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual((stagenet['state'], stagenet['reason']), ('stopped', 'stopped 6m ago'))
         self.assertIsNone(stagenet['container']['uptime'])
         self.assertTrue(360 <= stagenet['container']['stopped_ago'] <= 600)  # FINISHED is fixed at import time
-        probes = [call for call in FakeDocker.calls if call[0] == 'exec']
-        self.assertEqual(sorted(call[1] for call in probes), ['l2proxy', 'oxen00'])
+        # Every node carries its sample's freshness, and reading the listing probed nothing.
+        for node in nodes.values():
+            self.assertEqual((node['sample']['status'], node['sample']['pending'], node['sample']['error']), ('ok', False, None))
+            self.assertTrue(0 <= node['sample']['age'] <= 60, node['sample'])
+            self.assertTrue(node['sample']['at'].endswith('+00:00'))
+        self.assertEqual(payload['polling'], {'interval': 3600, 'peer_interval': 3600, 'cooldown': 0})
+        self.assertEqual(FakeDocker.calls, [])
 
     def test_single_node_and_unknown(self):
         status, payload = self.request('/api/nodes/oxen00')
@@ -257,10 +327,12 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(FakeDocker.calls, [])
         status, payload = self.mutate('/api/nodes/oxen00/restart')
         self.assertEqual(status, 200)
-        self.assertEqual(payload['name'], 'oxen00')
+        self.assertEqual((payload['name'], payload['sample']['status'], payload['sample']['pending']), ('oxen00', 'ok', False))
         self.assertIn(('restart', 'oxen00.container', 't=120'), FakeDocker.calls)
+        self.assertEqual(self.probes(), ['oxen00'])  # the action's own sample, and nothing else
         self.assertEqual(self.mutate('/api/nodes/stagenet00/start')[0], 200)
         self.assertIn(('start', 'stagenet00.container', ''), FakeDocker.calls)
+        self.assertEqual(self.request('/api/nodes')[1]['nodes'][1]['sample']['status'], 'ok')
 
     def test_register(self):
         status, payload = self.mutate('/api/nodes/oxen00/register', {'operator_address': 'nope'})
@@ -340,19 +412,26 @@ class ManagerTests(unittest.TestCase):
         auth = {'Authorization': 'Bearer secret'}
         self.server.manager.token = 'secret'
         self.server.manager.peers = {'remote': f'http://127.0.0.1:{self.peer.server_port}', 'down': 'http://127.0.0.1:9'}
+        for host in ('remote', 'down'):
+            self.server.manager.refresh_peer(host)
         status, payload = self.request('/api/nodes', headers=auth)
         self.assertEqual(status, 200)
         self.assertEqual(payload['host'], 'local')
-        remote, down = payload['peers']
+        down, remote = payload['peers']
         self.assertEqual((remote['host'], remote['project']), ('remote', PROJECT))
         self.assertEqual([node['name'] for node in remote['nodes']], ['l2proxy', 'oxen00', 'stagenet00'])
-        self.assertEqual((down['host'], down['nodes']), ('down', []))
+        self.assertEqual((remote['sample']['status'], remote['sample']['pending']), ('ok', False))
+        self.assertEqual(remote['nodes'][1]['sample']['status'], 'ok')
+        self.assertEqual((down['host'], down['nodes'], down['sample']['status']), ('down', [], 'failed'))
         self.assertIn('127.0.0.1:9', down['error'])
         self.assertIsNone(down['last_seen_ago'])
+        self.assertEqual(self.probes(), [])  # peer data comes from the peer's cache
         # A peer that answered once reports how long ago that was when it later fails.
-        self.server.manager.peer_seen['down'] = manager.time.monotonic() - 120
+        entry = self.server.manager.collector.entries[('peer', 'down')]
+        entry.ok_at, entry.data = manager.time.monotonic() - 120, {'project': PROJECT, 'nodes': []}
         _, payload = self.request('/api/nodes', headers=auth)
-        self.assertTrue(120 <= payload['peers'][1]['last_seen_ago'] <= 125)
+        self.assertTrue(120 <= payload['peers'][0]['last_seen_ago'] <= 125)
+        self.assertEqual(payload['peers'][0]['sample']['status'], 'failed')
         status, payload = self.request('/api/hosts/remote/nodes/oxen00', headers=auth)
         self.assertEqual((status, payload['name'], payload['node']['pubkey']), (200, 'oxen00', 'ab' * 32))
         status, text = self.request('/api/hosts/remote/nodes/oxen00/logs?tail=5', headers=auth)
@@ -362,10 +441,24 @@ class ManagerTests(unittest.TestCase):
         status, payload = self.request('/api/hosts/remote/nodes/oxen00/restart', {}, auth, 'POST')
         self.assertEqual(status, 403)
         self.assertEqual([call for call in FakeDocker.calls if call[0] == 'restart'], [])
+        fetched = self.request('/api/nodes', headers=auth)[1]['peers'][1]['sample']['at']
         status, payload = self.request('/api/hosts/remote/nodes/oxen00/restart', {},
                                        {**auth, 'X-Requested-With': 'session-node-manager'}, 'POST')
         self.assertEqual((status, payload['name']), (200, 'oxen00'))
         self.assertIn(('restart', 'oxen00.container', 't=120'), FakeDocker.calls)
+        self.assertEqual(self.probes(), ['oxen00'])  # the peer re-sampled the node it acted on
+        # ...and the hub refreshed its copy of that peer before answering.
+        self.assertNotEqual(self.request('/api/nodes', headers=auth)[1]['peers'][1]['sample']['at'], fetched)
+        # "Update now" on a remote node relays to the peer, which samples through its own collector.
+        status, payload = self.request('/api/hosts/remote/nodes/oxen00/refresh', {},
+                                       {**auth, 'X-Requested-With': 'session-node-manager'}, 'POST')
+        self.assertEqual((status, payload['name'], payload['sample']['status']), (200, 'oxen00', 'ok'))
+        self.assertEqual(self.probes(), ['oxen00', 'oxen00'])
+        # The hub can also re-fetch a peer's cache on request; that probes nothing.
+        status, payload = self.request('/api/hosts/remote/refresh', {}, {**auth, 'X-Requested-With': 'session-node-manager'}, 'POST')
+        self.assertEqual((status, payload['host'], payload['sample']['status']), (200, 'remote', 'ok'))
+        self.assertEqual(self.request('/api/hosts/remote/refresh', headers=auth)[0], 404)
+        self.assertEqual(self.probes(), ['oxen00', 'oxen00'])
         status, payload = self.request('/api/hosts/remote/nodes/oxen00/register', {'operator_address': 'bad'},
                                        {**auth, 'X-Requested-With': 'session-node-manager'}, 'POST')
         self.assertEqual(status, 400)
@@ -376,9 +469,12 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.request('/api/hosts/down/nodes', headers=auth)[0], 502)
         # The peer accepts only the shared token; a hub with the wrong token is rejected by the peer.
         self.server.manager.token = 'other'
+        self.server.manager.refresh_peer('remote')
         status, payload = self.request('/api/nodes', headers={'Authorization': 'Bearer other'})
         self.assertEqual(status, 200)
-        self.assertIn('MANAGER_TOKEN', payload['peers'][0]['error'])
+        self.assertIn('MANAGER_TOKEN', payload['peers'][1]['error'])
+        self.assertEqual(len(payload['peers'][1]['nodes']), 3)  # the last good listing is kept, marked failed
+        self.assertEqual(payload['peers'][1]['sample']['status'], 'failed')
         self.assertEqual(self.request('/api/hosts/remote/nodes', headers={'Authorization': 'Bearer other'})[0], 401)
 
     def test_syncing_suppresses_incidental_problems(self):
@@ -453,7 +549,7 @@ class ManagerTests(unittest.TestCase):
         held = manager.threading.Lock(); held.acquire()
         mgr.probe_locks['gone-but-probing.container'] = held
         try:
-            mgr.nodes()
+            mgr.collector.plan()
             self.assertNotIn('gone.container', mgr.sync_memory)
             self.assertNotIn('gone.container', mgr.probe_locks)
             self.assertIn('gone-but-probing.container', mgr.probe_locks)  # kept while its probe runs
@@ -462,17 +558,22 @@ class ManagerTests(unittest.TestCase):
             held.release()
             mgr.probe_locks.pop('gone-but-probing.container', None)
 
-    def test_overview_is_coalesced_and_peers_do_not_recurse(self):
-        mgr = self.server.manager
-        mgr.overview_cache = (0.0, None)
-        first = mgr.overview()
-        probes = len([c for c in FakeDocker.calls if c[0] == 'exec'])
-        second = mgr.overview()
-        self.assertEqual(first['nodes'], second['nodes'])
-        self.assertEqual(len([c for c in FakeDocker.calls if c[0] == 'exec']), probes)  # served from cache
-        mgr.overview_cache = (manager.time.monotonic() - manager.OVERVIEW_CACHE - 1, first['nodes'])
-        mgr.overview()
-        self.assertGreater(len([c for c in FakeDocker.calls if c[0] == 'exec']), probes)  # expired: a new round
+    def test_reads_never_probe_and_peers_do_not_recurse(self):
+        # Many dashboards opening at once read the same cache; none of them starts a probe.
+        results = []
+
+        def read(path):
+            results.append(self.request(path))
+        threads = [threading.Thread(target=read, args=(path,))
+                   for path in ['/api/nodes', '/api/nodes/oxen00', '/api/nodes?peers=0'] * 8]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual({status for status, _ in results}, {200})
+        self.assertEqual(FakeDocker.calls, [])
+        listings = [payload['nodes'] for _, payload in results if 'nodes' in payload]
+        self.assertTrue(all([node['name'] for node in listing] == ['l2proxy', 'oxen00', 'stagenet00'] for listing in listings))
         # A peer asked for its nodes answers without fanning out to its own peers.
         self.server.manager.token = 'secret'
         self.peer.manager.peers = {'loop': f'http://127.0.0.1:{self.server.server_port}'}
@@ -480,14 +581,213 @@ class ManagerTests(unittest.TestCase):
             status, payload = self.request('/api/nodes?peers=0', headers={'Authorization': 'Bearer secret'})
             self.assertEqual((status, payload['peers']), (200, []))
             self.server.manager.peers = {'remote': f'http://127.0.0.1:{self.peer.server_port}'}
-            self.server.manager.overview_cache = (0.0, None)
+            self.server.manager.refresh_peer('remote')
             status, payload = self.request('/api/nodes', headers={'Authorization': 'Bearer secret'})
             self.assertEqual(status, 200)
             remote, = payload['peers']
             self.assertIsNone(remote.get('error'))
             self.assertNotIn('peers', remote)  # the peer's own peer list is never relayed
+            self.assertEqual(self.probes(), [])
         finally:
             self.peer.manager.peers = {}
+
+    def test_schedule_is_staggered_and_skips_missed_slots(self):
+        mgr, collector, clock = self.collector()
+        before = mgr.collector.views('node')
+        self.assertEqual(before, [])  # nothing is known until the collector has planned
+        # The first round samples every node at once, in name order, and nothing else is due.
+        self.assertEqual(self.fill(collector), ['l2proxy', 'oxen00'])  # stagenet00 is stopped: no probe
+        self.assertEqual({node['name']: node['sample']['status'] for node in collector.views('node')},
+                         {'l2proxy': 'ok', 'oxen00': 'ok', 'stagenet00': 'ok'})
+        # Three nodes on a 300s interval: one every 100s, evenly spread.
+        self.assertEqual({key[1]: when - clock.now() for key, when in collector.due.items()},
+                         {'l2proxy': 100, 'oxen00': 200, 'stagenet00': 300})
+        self.assertEqual(collector.step(), 100)
+        clock.advance(100)
+        self.assertEqual(self.fill(collector), ['l2proxy'])
+        self.assertEqual(collector.due[('node', 'l2proxy')] - clock.now(), 300)
+        # Blocked for 900s (three missed slots each): every node is sampled once, not three times.
+        clock.advance(900)
+        self.assertEqual(self.fill(collector), ['oxen00', 'l2proxy'])
+        self.assertEqual({key[1]: when - clock.now() for key, when in collector.due.items()},
+                         {'oxen00': 100, 'stagenet00': 200, 'l2proxy': 300})
+        # Age is measured from the sample, and a sample that missed two rounds is stale.
+        views = {node['name']: node['sample'] for node in collector.views('node')}
+        self.assertEqual((views['oxen00']['age'], views['oxen00']['status']), (0, 'ok'))
+        clock.advance(599)
+        self.assertEqual(collector.view(('node', 'oxen00'))['sample']['status'], 'ok')
+        clock.advance(1)
+        self.assertEqual(collector.view(('node', 'oxen00'))['sample']['status'], 'stale')
+        # A recreated service is sampled in the next round without waiting for its slot.
+        FakeDocker.ids['stagenet00'] = 'stagenet00.v2'
+        self.assertEqual(self.fill(collector), ['oxen00', 'l2proxy'])  # all past due: once each; stagenet00 is stopped
+        self.assertEqual(collector.entries[('node', 'stagenet00')].container_id, 'stagenet00.v2')
+        self.assertFalse(collector.entries[('node', 'stagenet00')].pending)
+        self.assertEqual({key[1]: when - clock.now() for key, when in collector.due.items()},
+                         {'oxen00': 100, 'stagenet00': 200, 'l2proxy': 300})
+
+    def test_listing_failure_is_retried_without_touching_the_cache(self):
+        mgr, collector, clock = self.collector()
+        self.fill(collector)
+        FakeDocker.failing.add('*')
+        self.assertEqual(collector.step(), manager.LISTING_INTERVAL)
+        self.assertEqual([node['sample']['status'] for node in collector.views('node')], ['ok', 'ok', 'ok'])
+        FakeDocker.failing.clear()
+        self.assertEqual(collector.step(), 100)
+
+    def test_peer_caches_refresh_on_their_own_schedule(self):
+        peer_url = f'http://127.0.0.1:{self.peer.server_port}'
+        mgr, collector, clock = self.collector(peers={'remote': peer_url, 'down': 'http://127.0.0.1:9'})
+        self.fill(collector)
+        self.assertEqual(sorted(collector.due), [('node', 'l2proxy'), ('node', 'oxen00'), ('node', 'stagenet00'),
+                                                 ('peer', 'down'), ('peer', 'remote')])
+        self.assertEqual({key[1]: when - clock.now() for key, when in collector.due.items() if key[0] == 'peer'},
+                         {'down': 30, 'remote': 60})
+        down, remote = mgr.overview()['peers']
+        self.assertEqual((remote['project'], remote['sample']['status'], remote['error'] if 'error' in remote else None),
+                         (PROJECT, 'ok', None))
+        self.assertEqual([node['name'] for node in remote['nodes']], ['l2proxy', 'oxen00', 'stagenet00'])
+        self.assertEqual((down['nodes'], down['sample']['status'], down['last_seen_ago']), ([], 'failed', None))
+        self.assertIn('127.0.0.1:9', down['error'])
+        # Fetching a peer's cache never probes; the hub adds its own fetch age to the peer's sample ages.
+        FakeDocker.calls.clear()
+        clock.advance(60)
+        self.assertEqual(self.fill(collector), [])
+        remote = mgr.overview()['peers'][1]
+        self.assertEqual(remote['sample']['age'], 0)
+        clock.advance(45)
+        remote = mgr.overview()['peers'][1]
+        self.assertTrue(45 <= remote['nodes'][1]['sample']['age'] <= 75, remote['nodes'][1]['sample'])
+        # When the peer goes away its last listing stays, marked failed, with when it was last seen.
+        mgr.peers['remote'] = 'http://127.0.0.1:9'
+        mgr.collector.request(('peer', 'remote'), invalidate=True)
+        self.assertEqual(collector.step(), 0)
+        remote = mgr.overview()['peers'][1]
+        self.assertEqual((remote['sample']['status'], remote['last_seen_ago'], len(remote['nodes'])), ('failed', 45, 3))
+        self.assertIn('127.0.0.1:9', remote['error'])
+        self.assertEqual(self.probes(), [])
+
+    def test_forced_refresh_combines_duplicates_and_enforces_cooldown(self):
+        mgr, collector, clock = self.collector()
+        self.fill(collector)
+        key = ('node', 'oxen00')
+        with self.assertRaises(manager.Cooldown) as refused:  # just sampled by the first round
+            collector.request(key)
+        self.assertEqual(refused.exception.retry_after, 31)
+        self.assertIn('next update allowed in 31s', str(refused.exception))
+        clock.advance(31)
+        first = collector.request(key)
+        self.assertIs(collector.request(key), first)  # a duplicate joins the queued sample
+        self.assertTrue(collector.view(key)['sample']['pending'])
+        joined = []
+        FakeDocker.hooks['oxen00'] = lambda: joined.append(collector.request(key))  # arrives while it runs
+        self.assertEqual(collector.step(), 0)
+        self.assertEqual(self.probes('oxen00'), ['oxen00', 'oxen00'])  # one from the round, one for both requests
+        self.assertTrue(first.event.is_set())
+        self.assertIs(joined[0], first)
+        self.assertFalse(collector.view(key)['sample']['pending'])
+        with self.assertRaises(manager.Cooldown):
+            collector.request(key)
+        with self.assertRaises(manager.NotFound):
+            collector.request(('node', 'nobody'))
+        # An action on the node bypasses the cooldown: its state really changed.
+        ticket = collector.request(key, invalidate=True)
+        self.assertEqual(collector.step(), 0)
+        self.assertTrue(ticket.event.is_set())
+        # Over HTTP, a refused refresh answers 429 with when to retry.
+        FakeDocker.hooks.clear()
+        live = self.server.manager.collector
+        live.cooldown = 1000
+        try:
+            status, payload = self.mutate('/api/nodes/oxen00/refresh')
+            self.assertEqual(status, 429)
+            self.assertIn('next update allowed', payload['error'])
+            self.assertTrue(0 < payload['retry_after'] <= 1000)
+        finally:
+            live.cooldown = 0
+        status, payload = self.mutate('/api/nodes/oxen00/refresh')
+        self.assertEqual((status, payload['name'], payload['sample']['status']), (200, 'oxen00', 'ok'))
+        self.assertEqual(self.request('/api/nodes/oxen00/refresh', {}, method='POST')[0], 403)
+        self.assertEqual(self.mutate('/api/nodes/nobody/refresh')[0], 404)
+
+    def test_failed_sample_keeps_the_last_good_one(self):
+        mgr, collector, clock = self.collector()
+        self.fill(collector)
+        key = ('node', 'oxen00')
+        FakeDocker.failing.add('oxen00')
+        clock.advance(31)
+        collector.request(key)
+        self.assertEqual(collector.step(), 0)
+        node = collector.view(key)
+        self.assertEqual((node['state'], node['reason']), ('degraded', 'session-router not running'))  # last good data
+        self.assertEqual((node['sample']['status'], node['sample']['age'], node['sample']['pending']), ('failed', 31, False))
+        self.assertIn('exec in oxen00 refused', node['sample']['error'])
+        FakeDocker.failing.clear()
+        clock.advance(31)
+        collector.request(key)
+        collector.step()
+        node = collector.view(key)
+        self.assertEqual((node['sample']['status'], node['sample']['age'], node['sample']['error']), ('ok', 0, None))
+        # With no good sample yet, the node is unknown and says why; before any attempt it is pending.
+        FakeDocker.failing.add('oxen00')
+        mgr, collector, clock = self.collector()
+        collector.plan()
+        pending = collector.view(key)
+        self.assertEqual((pending['state'], pending['reason'], pending['needs_attention']), ('pending', 'waiting for the first sample', False))
+        self.assertEqual((pending['sample']['status'], pending['sample']['pending'], pending['sample']['age']), ('pending', True, None))
+        self.fill(collector)
+        failed = collector.view(key)
+        self.assertNotIn('state', failed)
+        self.assertIn('exec in oxen00 refused', failed['error'])
+        self.assertEqual((failed['sample']['status'], failed['sample']['age']), ('failed', None))
+        self.assertEqual(collector.view(('node', 'l2proxy'))['sample']['status'], 'ok')  # others unaffected
+
+    def test_outdated_results_never_overwrite_newer_state(self):
+        mgr, collector, clock = self.collector()
+        self.fill(collector)
+        key = ('node', 'oxen00')
+        old = collector.view(key)['container']['id']
+        # The container is recreated while its probe runs: the probe's result is for the old instance.
+        clock.advance(31)
+        ticket = collector.request(key)
+
+        def recreate():
+            FakeDocker.ids['oxen00'] = 'oxen00.v2'
+            collector.plan()
+        FakeDocker.hooks['oxen00'] = recreate
+        self.assertEqual(collector.step(), 0)
+        node = collector.view(key)
+        self.assertEqual((node['container']['id'], node['sample']['pending']), (old, True))  # old result dropped
+        self.assertFalse(ticket.event.is_set())  # the waiter gets the sample of the new container instead
+        FakeDocker.hooks.clear()
+        self.assertEqual(collector.step(), 0)
+        node = collector.view(key)
+        self.assertEqual((node['container']['id'], node['sample']['pending'], node['sample']['age']), ('oxen00.v2', False, 0))
+        self.assertTrue(ticket.event.is_set())
+        self.assertEqual(self.probes('oxen00'), ['oxen00'] * 3)
+        # An action (restart) during a scheduled sample: that sample is discarded and the
+        # action's own request answers everyone who was waiting.
+        clock.advance(31)
+        first = collector.request(key)
+        tickets = []
+        FakeDocker.hooks['oxen00'] = lambda: tickets.append(collector.request(key, invalidate=True))
+        self.assertEqual(collector.step(), 0)
+        FakeDocker.hooks.clear()
+        self.assertIsNot(tickets[0], first)
+        self.assertFalse(first.event.is_set())
+        self.assertTrue(collector.view(key)['sample']['pending'])
+        self.assertEqual(collector.step(), 0)
+        self.assertTrue(first.event.is_set() and tickets[0].event.is_set())
+        self.assertFalse(collector.view(key)['sample']['pending'])
+        # A service that disappears is dropped, together with anyone waiting on it.
+        FakeDocker.hooks['oxen00'] = lambda: collector.invalidate(key)  # a plain invalidation just re-queues
+        clock.advance(31)
+        ticket = collector.request(key)
+        collector.step()
+        self.assertIn(key, collector.forced)
+        FakeDocker.hooks.clear()
+        collector.step()
+        self.assertTrue(ticket.event.is_set())
 
     def test_parse_peers(self):
         self.assertEqual(manager.parse_peers(''), {})
