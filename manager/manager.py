@@ -25,6 +25,9 @@ NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
 # Paths that may be forwarded to a peer manager, relative to its /api/ prefix.
 PEER_PATH = re.compile(r'nodes(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/(?:logs|status|print_sn_status|restart|stop|start|register|refresh))?)?')
 ETH_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
+# Docker mounts a container's own hostname, hosts, and resolv.conf files from a directory
+# named after the container's full id; that path is visible in /proc/self/mountinfo.
+CONTAINER_ID = re.compile(r'/containers/([0-9a-f]{64})/(?:hostname|hosts|resolv\.conf)\b')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 PORT = 8080
 STOP_TIMEOUT = 120
@@ -1101,12 +1104,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.handle_method('POST')
 
 
-def identify(docker):
+def own_container_id(mountinfo='/proc/self/mountinfo'):
+    """This container's id from the files Docker mounts into it, or None outside Docker.
+
+    The hostname is not a reliable id: a tool that recreates a container by copying its
+    configuration (Portainer, Watchtower, and the like) copies the old hostname too, so
+    the new container is named after a container that no longer exists.
+    """
+    try:
+        match = CONTAINER_ID.search(Path(mountinfo).read_text())
+    except OSError:
+        return None
+    return match.group(1) if match else None
+
+
+def identify(docker, container=None):
     """Find this container's Compose project and service through its own labels."""
     project, service = os.environ.get('MANAGER_PROJECT'), os.environ.get('MANAGER_SERVICE', '')
     if project:
         return project, service
-    labels = docker.call('GET', f'/containers/{socket.gethostname()}/json')['Config'].get('Labels', {})
+    container = container or own_container_id() or socket.gethostname()
+    try:
+        labels = docker.call('GET', f'/containers/{container}/json')['Config'].get('Labels') or {}
+    except DockerError as error:
+        sys.exit(f'Docker does not know this container ({container}): {error}. The socket mounted at '
+                 f'/var/run/docker.sock may belong to a different daemon than the one running the manager '
+                 f'(rootless versus rootful: set DOCKER_SOCKET), or set MANAGER_PROJECT explicitly.')
     project = labels.get('com.docker.compose.project')
     if not project:
         sys.exit('Set MANAGER_PROJECT when not running as a Docker Compose service')

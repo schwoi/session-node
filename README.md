@@ -421,7 +421,12 @@ A hub does not need nodes of its own: a manager-only host runs just the
 `MANAGER_PEERS` set. It still needs the Docker socket to identify its Compose
 project and list its (empty) set of node containers, the same token as every
 peer, and a mesh address on which the peers are reachable. Sample ages are
-relative, so the hosts' clocks do not need to agree.
+relative, so the hosts' clocks do not need to agree. The manager finds its own
+container through the files Docker mounts into it rather than its hostname, so
+it still identifies its Compose project after an updater such as Portainer or
+Watchtower recreates it with the previous container's hostname. If Docker does
+not know the manager's container at all, the mounted socket belongs to another
+daemon (rootless versus rootful): set `DOCKER_SOCKET`, or set `MANAGER_PROJECT`.
 
 Node data is read through each container's loopback RPC, so a node's `oxend`
 must be running for anything beyond container status to appear; nodes that are
