@@ -63,11 +63,12 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
         'manager': {**hardened, 'image': MANAGER_IMAGE, 'read_only': True, 'cap_drop': ['ALL'],
                     'ports': ['127.0.0.1:0:8080/tcp'], 'volumes': [f'{socket_path}:/var/run/docker.sock:ro'],
                     'environment': {'ROLE': 'manager', 'MANAGER_TOKEN': TOKEN, 'MANAGER_HOST': 'hub',
-                                    'MANAGER_PEERS': 'second=http://peer:8080'}},
+                                    'MANAGER_PEERS': 'second=http://peer:8080', 'MANAGER_POLL_INTERVAL': '30'}},
         # A second manager standing in for another server; it happens to see the same project.
         'peer': {**hardened, 'image': MANAGER_IMAGE, 'read_only': True, 'cap_drop': ['ALL'],
                  'volumes': [f'{socket_path}:/var/run/docker.sock:ro'],
-                 'environment': {'ROLE': 'manager', 'MANAGER_TOKEN': TOKEN, 'MANAGER_HOST': 'second'}}}}
+                 'environment': {'ROLE': 'manager', 'MANAGER_TOKEN': TOKEN, 'MANAGER_HOST': 'second',
+                                 'MANAGER_POLL_INTERVAL': '30'}}}}
     (root / 'docker-compose.yml').write_text(json.dumps(config))
 
     def compose(*args, check=True):
@@ -96,12 +97,16 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
             status, payload = api(base, '/api/nodes')
             assert status == 200, payload
             nodes = {node['name']: node for node in payload['nodes']}
-            assert set(nodes) == {'l2proxy', 'stagenet00'}, list(nodes)  # Managers never list themselves.
+            if set(nodes) != {'l2proxy', 'stagenet00'}:
+                return None  # Discovery and collection run independently of reads.
             if all(node.get('node') and node['node']['rpc_ok'] and node['processes'] for node in nodes.values()):
-                return payload
+                if payload['peers'] and all(n.get('node') for n in payload['peers'][0]['nodes']) and len(payload['peers'][0]['nodes']) == 2:
+                    return payload
             return None
         payload = wait_for('both nodes to answer RPC', ready)
         assert (payload['project'], payload['host']) == (project, 'hub')
+        status, result = api(base, '/api/nodes/l2proxy/refresh', {})
+        assert status == 202 and result['refresh'] in ('queued', 'cooldown', 'already queued'), result
         peer, = payload['peers']
         assert (peer['host'], peer['project']) == ('second', project), peer
         assert sorted(node['name'] for node in peer['nodes']) == ['l2proxy', 'stagenet00'], peer
@@ -151,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix='session-manager-test-') as temp:
 
         status, result = api(base, '/api/nodes/stagenet00/stop', {})
         assert status == 200 and result['container']['state'] == 'exited', result
-        assert result['state'] == 'stopped' and result['reason'].startswith('stopped ') and result['node'] is None, result
+        assert result['problems'] == ['Container is exited'] and result['node'] is None, result
         assert api(base, '/api/nodes/stagenet00/register', {'operator_address': address})[0] == 400
         status, result = api(base, '/api/hosts/second/nodes/stagenet00/start', {})
         assert status == 200 and result['container']['state'] == 'running', result

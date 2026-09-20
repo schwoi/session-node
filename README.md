@@ -181,6 +181,7 @@ Keep `.env` private; it is ignored by Git. Environment values are visible to use
 | `MANAGER_TOKEN` | Empty | Bearer token required by the management dashboard and API when set |
 | `MANAGER_BIND` / `MANAGER_PORT` | `127.0.0.1` / `8080` | Host address and port publishing the dashboard |
 | `MANAGER_HOST` | `local` | Name of this server on a multi-server dashboard |
+| `MANAGER_POLL_INTERVAL` | `300` | Seconds between scheduled samples per node; minimum 30 |
 | `MANAGER_PEERS` | Empty | `name=http://mesh-address:8080` entries for other servers' managers |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker Engine socket mounted into the manager |
 
@@ -268,38 +269,20 @@ Follow the registration URL to stake. Before staking, verify full chain/L2 synch
 ## Management dashboard
 
 The optional `manager` service is a separate container that shows every node in
-this Compose project and lets you act on it from a browser or the JSON API. The
-page is built for scanning a fleet: a status bar leads with how many services
-need attention, hosts are collapsible groups in one table, and a detail drawer
-opens for the selected row (arrow keys move the selection, Escape closes it).
-Each service has exactly one state, derived once in the backend:
+this Compose project and lets you act on it from a browser or the JSON API:
 
-- **healthy**: running, every companion reported recently, chain within tolerance;
-- **syncing**: still doing its initial chain sync, shown as a percentage with the
-  blocks remaining. This is expected rather than a problem, so it does not count
-  as needing attention, and the incidental problems a syncing node produces
-  (failing health check, slow RPC, stale companion reports) are held back and
-  listed in the drawer until the chain catches up;
-- **degraded**: running, but a companion stopped reporting, the chain is behind,
-  the health check fails, or oxend's RPC does not answer; the Status column
-  says which;
-- **stopped**: the container is not running. It still counts as needing
-  attention, but it is shown in grey rather than red because a deliberate stop
-  is not an outage;
-
-A host whose manager cannot be reached is a different case: its services have no
-state at all, so the dashboard shows the host as a red, collapsed **unreachable**
-group with how long ago it last answered, rather than guessing that its nodes
-are down.
-
-Rows show uptime, height, P2P peers, one chip per supervised process
-(`oxend`, `oxen-storage`, `lokinet`, `session-router`) coloured by its own
-reporting state, and version drift against the rest of the fleet. The drawer
-adds L2 tracker height, per-process report ages, TCP connections per service
-port, image and version, identity, and staking state. Actions: logs,
-`oxend status`, `print_sn_status`, restart, stop, start, bulk restart or stop
-of selected rows, and registration for staking. The layout targets desktop
-widths; on narrow screens the table scrolls sideways.
+- container state, Docker health, uptime, image, and restart count;
+- oxend version, chain height versus sync target, and L2 tracker height;
+- each supervised process (`oxend`, `oxen-storage`, `lokinet`, `session-router`)
+  with the age of its last report to oxend;
+- inbound and outbound connections: oxend's P2P peer counts, plus established
+  TCP connections per service port (p2p, quorumnet, storage) read from the
+  container. Lokinet and Session Router relay over UDP and have no connections
+  to count;
+- node identity and staking state: unregistered, registered, awaiting stake,
+  or decommissioned;
+- container logs, `oxend status`, and `print_sn_status` output;
+- restart, stop, and start; and registration for staking.
 
 ```bash
 docker compose up -d --no-build manager
@@ -310,6 +293,35 @@ The dashboard image is `ghcr.io/schwoi/session-node-manager`; select a version w
 `SESSION_MANAGER_IMAGE` or build locally with `docker compose build manager`. The
 container uses only the Python standard library and runs read-only with all
 capabilities dropped.
+
+Each manager collects its own nodes in the background every five minutes by
+default. Nodes and the L2 proxy are spread evenly across the interval: four
+nodes plus a proxy start about one minute apart. Collection is serial and
+bounded by a 25-second probe timeout. New containers are discovered through
+Docker metadata every 30 seconds; their first sample arrives at their scheduled
+offset. Slow or missed polls are skipped rather than replayed in a burst.
+
+All dashboard overview and detail reads use saved samples, including remote
+host views. Opening more dashboards does not run more node probes. Managers
+fetch their peers' saved samples every 15 seconds without recursive peer
+lookups. Run one collecting manager per Compose project. Each card shows when
+its sample was taken; heartbeat ages and uptime describe that sample, and old
+samples are marked stale. A failure can therefore take up to five minutes plus
+collection time to appear in the dashboard. Docker health checks still run
+independently every 30 seconds.
+
+**Reload view** only reloads saved data. **Update now** on a node requests an
+early sample, locally or through a peer manager. It uses the same serial
+collector: duplicate requests are combined, updates to a node have a 30-second
+cooldown, and successive probes have at least a five-second gap. The API is
+`POST /api/nodes/NAME/refresh` (or `/api/hosts/HOST/nodes/NAME/refresh`), with the
+usual authentication and `X-Requested-With` header; HTTP 202 acknowledges the
+queue request. Explicit log, CLI, registration, and power actions remain live
+operations. Power actions invalidate the old sample and queue a new one.
+
+Set `MANAGER_POLL_INTERVAL=300` in `.env` to retain the default, then recreate
+only the manager after deploying its updated image. All managers serving peer
+data must use this version to guarantee that peer reads cannot start probes.
 
 Registration runs `oxend register OPERATOR_ADDRESS` inside the selected node.
 **Preview** adds `print` and only displays the signed registration details.

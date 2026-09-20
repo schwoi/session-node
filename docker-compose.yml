@@ -29,6 +29,7 @@ services:
       - MANAGER_TOKEN=${MANAGER_TOKEN:-}
       # Multi-server dashboard: name shown for this host, and peer managers to include.
       - MANAGER_HOST=${MANAGER_HOST:-local}
+      - MANAGER_POLL_INTERVAL=${MANAGER_POLL_INTERVAL:-300}
       - MANAGER_PEERS=${MANAGER_PEERS:-}
 
   # ── L2 Proxy ───────────────────────────────────────────────────

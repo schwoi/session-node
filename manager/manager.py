@@ -4,7 +4,7 @@
 Talks to the Docker Engine socket only; node state is read through each node's
 loopback-bound oxend RPC by running a probe inside its container.
 """
-import concurrent.futures
+import copy
 import hmac
 import http.client
 import http.server
@@ -24,31 +24,15 @@ from datetime import datetime, timezone
 STATIC = Path(__file__).resolve().parent
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
 # Paths that may be forwarded to a peer manager, relative to its /api/ prefix.
-PEER_PATH = re.compile(r'nodes(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/(?:logs|status|print_sn_status|restart|stop|start|register))?)?')
+PEER_PATH = re.compile(r'nodes(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/(?:logs|status|print_sn_status|restart|stop|start|register|refresh))?)?')
 ETH_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 PORT = 8080
 STOP_TIMEOUT = 120
-# Seconds without a companion report before it counts as not reporting. Matches
-# healthcheck.sh so the dashboard and Docker's health status never disagree.
 PING_STALE = 300
-# Blocks behind the daemon's own sync target before a node counts as lagging. The
-# target comes from oxend's peers, so it tracks the network tip even when every
-# node on this dashboard is still syncing.
-BEHIND_WARN = 2
-# Further behind than this and the node is doing its initial sync: expected, not an
-# incident, and the incidental problems it causes are held back until it catches up.
-SYNC_BEHIND = 100
-# How long a remembered sync snapshot may stand in for a node whose RPC is busy.
-SYNC_MEMORY = 3600
-# Hard ceiling on one probe inside a node container. The probe is killed at this
-# point so a stalled node can never accumulate probe processes across polls.
-PROBE_DEADLINE = 40
-# A finished overview is reused for this long, so several browsers, a peer, and
-# auto-refresh share one probe round instead of each starting their own.
-OVERVIEW_CACHE = 10
-# How recent oxend's own "Synced H/T" log line must be to count as current progress.
-SYNC_LOG_FRESH = 600
+POLL_INTERVAL = 300
+FORCE_COOLDOWN = 30
+PROBE_GAP = 5
 OXEND = ['oxend', '--config-file=/etc/oxen/oxen.conf']
 PINGS = (('oxen-storage', 'last_storage_server_ping'), ('lokinet', 'last_lokinet_ping'),
          ('session-router', 'last_session_router_ping'))
@@ -59,19 +43,12 @@ PROBE = r'''
 set -uo pipefail
 port=22023
 [[ ${NETWORK:-mainnet} != stagenet ]] || port=11023
-# A node under sync load can take well over five seconds to answer; allow fifteen,
-# and issue the three RPC calls at once so the probe never waits longer than that.
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-rpc() { curl -fsS --max-time 15 -H 'Content-Type: application/json' \
+rpc() { curl -fsS --max-time 5 -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\"}" "http://127.0.0.1:$port/json_rpc"; }
-curl -fsS --max-time 15 "http://127.0.0.1:$port/get_info" > "$tmp/info" 2>/dev/null &
-rpc get_service_keys > "$tmp/keys" 2>/dev/null &
-[[ ${ROLE:-node} != node ]] || rpc get_service_node_status > "$tmp/sn" 2>/dev/null &
-wait
-info=$(jq -c . "$tmp/info" 2>/dev/null) || info=null
-keys=$(jq -c . "$tmp/keys" 2>/dev/null) || keys=null
-sn=$(jq -c . "$tmp/sn" 2>/dev/null) || sn=null
+info=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/get_info") || info=null
+keys=$(rpc get_service_keys) || keys=null
+sn=null
+[[ ${ROLE:-node} != node ]] || sn=$(rpc get_service_node_status) || sn=null
 procs='[]'
 if [[ -s /run/session-node.pids ]]; then
   procs=$(while IFS= read -r pid; do
@@ -84,42 +61,30 @@ fi
 # Established TCP connections, excluding loopback: inbound by our listening port,
 # outbound by the remote service port. UDP relays (Lokinet, Session Router) are connectionless.
 conns=$(
-  declare -A listening
-  for table in /proc/net/tcp /proc/net/tcp6; do
-    [[ -r $table ]] || continue
-    while read -r _ local _ state _; do
-      [[ $state == 0A ]] && listening[$((16#${local##*:}))]=1
-    done < "$table"
-  done
-  for table in /proc/net/tcp /proc/net/tcp6; do
-    [[ -r $table ]] || continue
-    while read -r _ local remote state _; do
-      [[ $state == 01 ]] || continue
-      case ${remote%%:*} in 0100007F|00000000000000000000000001000000|0000000000000000FFFF00000100007F) continue;; esac
-      port=$((16#${local##*:}))
-      if [[ -n ${listening[$port]:-} ]]; then echo "in $port"; else echo "out $((16#${remote##*:}))"; fi
-    done < "$table"
-  done | sort | uniq -c | jq -cRn '[inputs | capture("^ *(?<n>[0-9]+) (?<d>in|out) (?<p>[0-9]+)$")
-    | {direction:.d, port:(.p|tonumber), count:(.n|tonumber)}]'
+  awk '
+    function hex(s, n,i) {
+      n=0; for(i=1;i<=length(s);i++) n=n*16+index("0123456789ABCDEF",toupper(substr(s,i,1)))-1;
+      return n
+    }
+    $4=="0A" {split($2,a,":"); listening[hex(a[2])]=1}
+    $4=="01" {
+      split($2,a,":"); split($3,b,":");
+      if (b[1]=="0100007F" || b[1]=="00000000000000000000000001000000" || b[1]=="0000000000000000FFFF00000100007F") next;
+      local_port[++n]=hex(a[2]); remote_port[n]=hex(b[2])
+    }
+    END {
+      for(i=1;i<=n;i++) {
+        if(local_port[i] in listening) counts["in " local_port[i]]++;
+        else counts["out " remote_port[i]]++
+      }
+      for(k in counts) print counts[k],k
+    }' /proc/net/tcp /proc/net/tcp6 |
+    jq -cRn '[inputs | capture("^(?<n>[0-9]+) (?<d>in|out) (?<p>[0-9]+)$")
+      | {direction:.d, port:(.p|tonumber), count:(.n|tonumber)}]'
 )
-# oxend logs "Synced H/T" every few seconds during initial sync even when its RPC is
-# too busy to answer, so the newest such line is the reliable progress signal.
-synclog=null
-if [[ -r /var/lib/oxen/oxen.log ]]; then
-  line=$(tail -n 5000 /var/lib/oxen/oxen.log | sed -nE 's/^\[([0-9-]+ [0-9:]+)\].*Synced ([0-9]+)\/([0-9]+).*/\1|\2|\3/p' | tail -n 1)
-  if [[ -n $line ]]; then
-    IFS='|' read -r stamp h t <<< "$line"
-    at=$(date -u -d "$stamp" +%s 2>/dev/null || echo 0)
-    synclog=$(jq -cn --argjson h "$h" --argjson t "$t" --argjson age "$(( $(date +%s) - at ))" '{height:$h,target:$t,age:$age}')
-  fi
-fi
-# A malformed piece must degrade to null, never fail the whole reading.
-json_or() { if jq -e . >/dev/null 2>&1 <<< "$1"; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
-info=$(json_or "$info" null); keys=$(json_or "$keys" null); sn=$(json_or "$sn" null)
-procs=$(json_or "$procs" '[]'); conns=$(json_or "$conns" '[]'); synclog=$(json_or "$synclog" null)
 jq -cn --argjson info "$info" --argjson keys "$keys" --argjson sn "$sn" --argjson procs "$procs" \
-  --argjson conns "$conns" --argjson synclog "$synclog" --argjson now "$(date +%s)" \
-  '{info:$info,keys:$keys,sn:$sn,processes:$procs,connections:$conns,synclog:$synclog,now:$now}'
+  --argjson conns "${conns:-[]}" --argjson now "$(date +%s)" \
+  '{info:$info,keys:$keys,sn:$sn,processes:$procs,connections:$conns,now:$now}'
 '''
 
 
@@ -199,81 +164,35 @@ def parse_time(value):
     return datetime.fromisoformat(value.replace('Z', '+00:00'))
 
 
-def ago(seconds):
-    """Compact duration such as 45s, 6m, 2h 10m, or 3d 4h."""
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f'{seconds}s'
-    minutes, hours, days = seconds // 60, seconds // 3600, seconds // 86400
-    if minutes < 60:
-        return f'{minutes}m'
-    if hours < 24:
-        return f'{hours}h {minutes % 60}m'
-    return f'{days}d {hours % 24}h'
-
-
 def problems(summary):
-    """Short status phrases, worst first; empty when nothing needs attention."""
     container, node = summary['container'], summary['node']
     found = []
     if container['state'] != 'running':
-        stopped = container.get('stopped_ago')
-        return [f'stopped {ago(stopped)} ago' if stopped is not None else container['state']]
-    if container['health'] == 'unhealthy':
-        found.append('health check failing')
+        return [f"Container is {container['state']}"]
+    if container['health'] not in (None, 'healthy'):
+        found.append(f"Docker health check: {container['health']}")
     if summary['role'] not in ('node', 'proxy'):
         return found
     if node is None or not node['rpc_ok']:
-        return found + ['oxend RPC unreachable']
+        return found + ['oxend RPC is unreachable']
     for process in summary['processes']:
         if not process['alive']:
-            found.append(f"{process['name'] or process['pid']} not running")
+            found.append(f"{process['name'] or process['pid']} is not running")
     for service, age in node['pings'].items():
         if age is None:
-            found.append(f'{service} never reported')
+            found.append(f'{service} has never reported to oxend')
         elif age > PING_STALE:
-            found.append(f'{service} not reporting ({ago(age)})')
-    if node['behind'] >= BEHIND_WARN:
-        found.append(f"{node['behind']} blocks behind")
+            found.append(f'{service} last reported {int(age // 60)} minutes ago')
+    behind = (node['target_height'] or 0) - (node['height'] or 0)
+    if behind > 1:
+        found.append(f'Blockchain is {behind} blocks behind')
     tracker, chain = node['l2_tracker_height'], node['l2_height']
     if tracker is not None and chain is not None and tracker < chain:
-        found.append(f'L2 tracker {chain - tracker} blocks behind')
+        found.append(f'L2 tracker is {chain - tracker} blocks behind the chain')
     service_node = node['service_node']
     if service_node and service_node['registered'] and service_node['active'] is False:
-        found.append('decommissioned')
+        found.append('Service node is decommissioned')
     return found
-
-
-def sync_progress(height, target):
-    """Initial-sync progress as (percent, blocks left), or None when not in initial sync."""
-    if not target or height is None or target - height < SYNC_BEHIND:
-        return None
-    return round(100 * height / target, 1), target - height
-
-
-def assess(summary, found=None):
-    """The single derivation of service state: healthy, syncing, degraded, or stopped."""
-    found = problems(summary) if found is None else found
-    if summary['container']['state'] != 'running':
-        return {'state': 'stopped', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
-    sync = summary.get('sync')
-    if sync:
-        # Initial sync is expected. Everything else it causes waits until the chain has caught up.
-        # A registered node catching up is still expected, but it risks decommission, so it keeps
-        # the operator's attention while showing the same progress.
-        reason = f"syncing {sync['percent']}%" + (' · RPC busy' if sync.get('recalled') else '')
-        at_risk = bool(sync.get('registered'))
-        if at_risk:
-            reason += ' · registered node at risk'
-        # The block deficit is the sync itself, and a busy RPC is already stated in the reason.
-        suppressed = [item for item in found if (not item.endswith('blocks behind') or item.startswith('L2'))
-                      and not (sync.get('recalled') and item == 'oxend RPC unreachable')]
-        return {'state': 'syncing', 'reason': reason, 'needs_attention': at_risk, 'suppressed': suppressed}
-    if found:
-        return {'state': 'degraded', 'reason': found[0], 'needs_attention': True, 'suppressed': []}
-    starting = summary['container']['health'] == 'starting'
-    return {'state': 'healthy', 'reason': 'starting' if starting else 'healthy', 'needs_attention': False,
-            'suppressed': []}
 
 
 def service_ports(env, network):
@@ -314,9 +233,7 @@ def describe(probe, role, network):
             'start_time': info.get('start_time'), 'status_line': info.get('status_line'),
             'peers': {'inbound': info.get('incoming_connections_count'),
                       'outbound': info.get('outgoing_connections_count')},
-            'behind': max(0, (info.get('target_height') or 0) - (info.get('height') or 0)),
             'pubkey': keys.get('service_node_ed25519_pubkey'), 'pings': {}, 'service_node': None}
-    node['lagging'] = node['behind'] >= BEHIND_WARN
     if role == 'node' and network == 'mainnet':
         for service, key in PINGS:
             stamp = info.get(key)
@@ -354,19 +271,160 @@ def parse_peers(value):
 
 
 class Manager:
-    def __init__(self, docker, project, own_service, host='local', peers=None, token=''):
+    def __init__(self, docker, project, own_service, host='local', peers=None, token='',
+                 interval=POLL_INTERVAL, clock=time.monotonic):
         self.docker = docker
         self.project = project
         self.own_service = own_service
         self.host = host
         self.peers = peers or {}
         self.token = token
-        self.peer_seen = {}  # host -> monotonic time of the last successful overview
-        self.probe_locks = {}  # container id -> lock held while its probe runs
-        self.state_lock = threading.Lock()  # guards sync_memory and probe_locks themselves
-        self.overview_lock = threading.Lock()
-        self.overview_cache = (0.0, None)  # (monotonic time, result) of the last local listing
-        self.sync_memory = {}  # container id -> last (height, target, monotonic time) seen while syncing
+        if interval < 30:
+            raise ValueError('MANAGER_POLL_INTERVAL must be at least 30 seconds')
+        self.interval = interval
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.closed = threading.Event()
+        self.threads = []
+        self.cache = {}
+        self.peer_cache = {}
+        self.schedule = {}
+        self.forced = set()
+        self.inflight = None
+        self.last_started = {}
+        self.next_probe = 0
+        self.next_discovery = 0
+        self.discovery_error = None
+
+    def start(self):
+        for target in (self.collect, self.collect_peers):
+            thread = threading.Thread(target=target, daemon=True)
+            self.threads.append(thread)
+            thread.start()
+
+    def close(self):
+        self.closed.set()
+        self.wake.set()
+        for thread in self.threads:
+            thread.join(timeout=2)
+
+    def discover(self):
+        """Refresh membership outside request threads, including recreated containers."""
+        found = self.containers()
+        entries = {}
+        for name, cid in sorted(found.items()):
+            try:
+                details = self.details(name, cid)
+            except NotFound:
+                continue
+            entries[name] = (cid, details)
+        now = self.clock()
+        with self.lock:
+            old_names = set(self.schedule)
+            self.schedule = {name: self.schedule.get(name, {'id': cid, 'due': now})
+                             for name, (cid, _) in entries.items()}
+            if set(entries) != old_names:
+                spacing = self.interval / max(1, len(entries))
+                for i, name in enumerate(sorted(entries)):
+                    self.schedule[name]['due'] = max(now + i * spacing,
+                        self.last_started.get(name, -self.interval) + self.interval)
+            for name, (cid, details) in entries.items():
+                entry = self.schedule[name]
+                generation = (cid, details['State'].get('StartedAt'), details['State']['Status'])
+                if entry.get('generation') != generation:
+                    entry.update(id=cid, generation=generation)
+                    summary = self.inspect(name, cid, details, probe=False)
+                    summary['sample'] = {'at': None, 'state': 'pending'}
+                    self.cache[name] = summary
+            for name in set(self.cache) - set(entries):
+                self.cache.pop(name, None)
+                self.last_started.pop(name, None)
+            self.forced.intersection_update(entries)
+            self.discovery_error = None
+            self.next_discovery = now + 30
+
+    def refresh(self, name):
+        """Queue one explicit sample; readers never call this method."""
+        with self.lock:
+            if name not in self.schedule:
+                raise NotFound(f'No collected node named {name}')
+            if name == self.inflight or name in self.forced:
+                state = 'already queued'
+            elif self.clock() - self.last_started.get(name, -FORCE_COOLDOWN) < FORCE_COOLDOWN:
+                state = 'cooldown'
+            else:
+                self.forced.add(name)
+                state = 'queued'
+            self.wake.set()
+            return {'name': name, 'refresh': state, 'cooldown_seconds': FORCE_COOLDOWN}
+
+    def collect_one(self):
+        """One serial collector owns all probes, including forced samples."""
+        with self.lock:
+            now = self.clock()
+            if self.inflight or now < self.next_probe:
+                return False
+            eligible = [name for name in self.schedule
+                        if now - self.last_started.get(name, -self.interval) >= FORCE_COOLDOWN
+                        and (name in self.forced or self.schedule[name]['due'] <= now)]
+            if not eligible:
+                return False
+            name = min(eligible, key=lambda n: (n not in self.forced, self.schedule[n]['due'], n))
+            entry = self.schedule[name]
+            cid = entry['id']
+            revision = entry.get('revision', 0)
+            self.inflight = name
+            self.forced.discard(name)
+            self.last_started[name] = now
+            # Keep the original phase after a manual update. Never catch up missed polls in a burst.
+            if entry['due'] <= now:
+                entry['due'] += (int((now - entry['due']) / self.interval) + 1) * self.interval
+        try:
+            summary = self.inspect(name, cid)
+            summary['sample'] = {'at': datetime.now(timezone.utc).isoformat(), 'state': 'ready'}
+        except Exception as error:
+            summary = {'name': name, 'error': str(error),
+                       'sample': {'at': datetime.now(timezone.utc).isoformat(), 'state': 'failed'}}
+        with self.lock:
+            if name in self.schedule and self.schedule[name].get('revision', 0) == revision:
+                self.cache[name] = summary
+            self.inflight = None
+            self.next_probe = self.clock() + PROBE_GAP
+        return True
+
+    def collect(self):
+        while not self.closed.is_set():
+            try:
+                if self.clock() >= self.next_discovery:
+                    self.discover()
+                self.collect_one()
+            except Exception as error:
+                with self.lock:
+                    self.discovery_error = f'Collector failed: {type(error).__name__}'
+                    self.next_discovery = self.clock() + 30
+            self.wake.wait(1)
+            self.wake.clear()
+
+    def collect_peers(self):
+        """Fetch only peer caches, independently of browser traffic. No recursive aggregation."""
+        while not self.closed.is_set():
+            for host in self.peers:
+                if self.closed.is_set():
+                    return
+                snapshot = self.peer_overview(host)
+                with self.lock:
+                    self.peer_cache[host] = snapshot
+            self.closed.wait(15)
+
+    def cached(self, name):
+        with self.lock:
+            if name not in self.cache:
+                raise NotFound(f'No collected node named {name}')
+            result = copy.deepcopy(self.cache[name])
+            result['sample']['refreshing'] = name == self.inflight or name in self.forced
+            result['sample']['interval_seconds'] = self.interval
+            return result
 
     def containers(self):
         filters = urllib.parse.quote(json.dumps({'label': [f'com.docker.compose.project={self.project}']}))
@@ -396,165 +454,68 @@ class Manager:
             raise NotFound(f'{name} is a manager, not a node')
         return details
 
-    def inspect(self, name, container_id, details=None):
+    def inspect(self, name, container_id, details=None, probe=True):
         details = details or self.details(name, container_id)
         env = details['env']
         state = details['State']
-        now = datetime.now(timezone.utc)
         started = parse_time(state.get('StartedAt')) if state.get('Running') else None
-        finished = parse_time(state.get('FinishedAt')) if not state.get('Running') else None
         summary = {
             'name': name, 'network': env.get('NETWORK', 'mainnet'), 'role': env.get('ROLE', 'node'),
             'container': {
                 'id': container_id[:12], 'state': state.get('Status'),
                 'health': (state.get('Health') or {}).get('Status'),
                 'started_at': started.isoformat() if started else None,
-                'uptime': int((now - started).total_seconds()) if started else None,
-                'stopped_ago': int((now - finished).total_seconds()) if finished else None,
+                'uptime': int((datetime.now(timezone.utc) - started).total_seconds()) if started else None,
                 'restart_count': details.get('RestartCount', 0), 'image': details['Config'].get('Image')},
             'node': None, 'processes': [], 'connections': None, 'problems': []}
-        probe = None
-        if state.get('Running') and summary['role'] in ('node', 'proxy'):
+        if probe and state.get('Running') and summary['role'] in ('node', 'proxy'):
             probe = self.probe(container_id)
             if probe:
                 summary['node'] = describe(probe, summary['role'], summary['network'])
                 summary['connections'] = connections(probe.get('connections'),
                                                      service_ports(env, summary['network']))
-                pings = summary['node']['pings']
-                for process in probe.get('processes') or []:
-                    name = PROCESS_NAMES.get(process.get('name'), process.get('name'))
-                    age = pings.get(name)
-                    # Stale means the companion stopped reporting to oxend, or never started reporting.
-                    stale = name in pings and (age is None or age > PING_STALE)
-                    summary['processes'].append({**process, 'name': name, 'reported_ago': age,
-                                                 'stale': stale or not process.get('alive', True)})
-        summary['sync'] = self.sync_state(container_id, summary, (probe or {}).get('synclog'))
+                summary['processes'] = [{**process, 'name': PROCESS_NAMES.get(process.get('name'), process.get('name'))}
+                                        for process in probe.get('processes') or []]
         summary['problems'] = problems(summary)
-        summary.update(assess(summary, summary['problems']))
-        if summary['state'] == 'syncing':
-            summary['problems'] = []
         return summary
 
-    def sync_state(self, container_id, summary, synclog=None):
-        """Initial-sync progress from RPC, else from oxend's own log, else remembered from earlier."""
-        with self.state_lock:
-            return self._sync_state(container_id, summary, synclog)
-
-    def _sync_state(self, container_id, summary, synclog):
-        node = summary['node']
-        if not summary['container']['state'] == 'running':
-            self.sync_memory.pop(container_id, None)
-            return None
-        if node and node['rpc_ok']:
-            progress = sync_progress(node['height'], node['target_height'])
-            if progress:
-                registered = bool((node.get('service_node') or {}).get('registered'))
-                self.sync_memory[container_id] = (node['height'], node['target_height'], time.monotonic(), registered)
-                return {'percent': progress[0], 'remaining': progress[1], 'height': node['height'],
-                        'target': node['target_height'], 'recalled': False, 'registered': registered}
-            self.sync_memory.pop(container_id, None)
-            return None
-        remembered = self.sync_memory.get(container_id)
-        if synclog and isinstance(synclog.get('age'), int) and 0 <= synclog['age'] < SYNC_LOG_FRESH:
-            progress = sync_progress(synclog.get('height'), synclog.get('target'))
-            if progress:
-                registered = bool(remembered and remembered[3])
-                self.sync_memory[container_id] = (synclog['height'], synclog['target'], time.monotonic(), registered)
-                return {'percent': progress[0], 'remaining': progress[1], 'height': synclog['height'],
-                        'target': synclog['target'], 'recalled': True, 'registered': registered, 'age': synclog['age']}
-        if remembered and time.monotonic() - remembered[2] >= SYNC_MEMORY:
-            self.sync_memory.pop(container_id, None)  # too old to trust; forget it
-            remembered = None
-        if remembered:
-            progress = sync_progress(remembered[0], remembered[1])
-            if progress:
-                return {'percent': progress[0], 'remaining': progress[1], 'height': remembered[0],
-                        'target': remembered[1], 'recalled': True, 'registered': remembered[3],
-                        'age': int(time.monotonic() - remembered[2])}
-        return None
-
     def probe(self, container_id):
-        """Run the probe with a hard deadline, and never more than once per container at a time."""
-        with self.state_lock:
-            lock = self.probe_locks.setdefault(container_id, threading.Lock())
-        if not lock.acquire(blocking=False):
-            print(f'Probe of container {container_id[:12]} skipped; the previous one is still running',
-                  file=sys.stderr, flush=True)
-            return None
         try:
-            # setsid puts the probe in its own process group and timeout(1) kills that whole
-            # group at the deadline, so no curl or jq child is left behind inside the node
-            # even if the Docker exec itself is abandoned.
-            command = ['setsid', '-w', 'timeout', '-s', 'KILL', '-k', '5', str(PROBE_DEADLINE), 'bash', '-c', PROBE]
-            code, stdout, output = self.docker.exec(container_id, command, timeout=PROBE_DEADLINE + 10)
+            # Isolate and kill the whole process group even if Docker exec disconnects.
+            code, stdout, output = self.docker.exec(container_id,
+                ['setsid', '-w', 'timeout', '--signal=KILL', '25s', 'bash', '-c', PROBE])
             if code == 0:
                 return json.loads(stdout)
-            reason = 'killed at the deadline' if code == 137 else f'exit code {code}: {output.strip()[-300:]}'
+            reason = f'exit code {code}: {output.strip()[-300:]}'
         except (DockerError, OSError, ValueError) as error:
             reason = str(error)
-        finally:
-            lock.release()
         print(f'Probe of container {container_id[:12]} failed; {reason}', file=sys.stderr, flush=True)
         return None
 
     def nodes(self):
-        containers = self.containers()
-        self.forget_stale(set(containers.values()))
-
-        def one(item):
-            try:
-                return self.inspect(*item)
-            except NotFound:
-                return None
-            except (DockerError, OSError, KeyError) as error:
-                return {'name': item[0], 'error': str(error)}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            return sorted(filter(None, pool.map(one, containers.items())), key=lambda node: node['name'])
-
-    def forget_stale(self, current):
-        """Drop per-container state for containers that no longer exist (recreated services)."""
-        with self.state_lock:
-            for container_id in [c for c in self.sync_memory if c not in current]:
-                self.sync_memory.pop(container_id, None)
-            for container_id, lock in [(c, l) for c, l in self.probe_locks.items() if c not in current]:
-                if not lock.locked():  # a running probe keeps its lock until it finishes
-                    self.probe_locks.pop(container_id, None)
-
-    def local_nodes(self):
-        """The local listing, computed at most once per OVERVIEW_CACHE seconds.
-
-        Callers that arrive while a round is running wait for that round rather than
-        starting another, so the probe rate is bounded by the poll interval no matter
-        how many browsers or peers are asking.
-        """
-        with self.overview_lock:
-            stamp, cached = self.overview_cache
-            if cached is not None and time.monotonic() - stamp < OVERVIEW_CACHE:
-                return cached
-            result = self.nodes()
-            self.overview_cache = (time.monotonic(), result)
-            return result
+        with self.lock:
+            return [self.cached(name) for name in sorted(self.cache)]
 
     def overview(self, include_peers=True):
-        """Local nodes plus one entry per peer manager, fetched concurrently."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            local = pool.submit(self.local_nodes)
-            peers = list(pool.map(self.peer_overview, self.peers)) if include_peers else []
-            return {'host': self.host, 'project': self.project, 'nodes': local.result(), 'peers': peers}
+        with self.lock:
+            return {'host': self.host, 'project': self.project, 'nodes': self.nodes(),
+                    'collection_error': self.discovery_error, 'interval_seconds': self.interval,
+                    'peers': [copy.deepcopy(self.peer_cache.get(host,
+                        {'host': host, 'project': None, 'nodes': [], 'error': 'Waiting for peer cache'}))
+                        for host in self.peers] if include_peers else []}
 
     def peer_overview(self, host):
         try:
-            # Peers answer for their own nodes only, so two hubs listing each other never recurse.
-            status, _, payload = self.forward(host, 'GET', 'nodes?peers=0', timeout=PROBE_DEADLINE + 20)
+            status, _, payload = self.forward(host, 'GET', 'nodes?peers=0', timeout=5)
             data = json.loads(payload)
             if status != 200 or not isinstance(data, dict):
                 raise ValueError(data.get('error') if isinstance(data, dict) else f'HTTP {status}')
-            self.peer_seen[host] = time.monotonic()
-            return {'host': host, 'project': data.get('project'), 'nodes': data.get('nodes') or []}
+            result = {'host': host, 'project': data.get('project'), 'nodes': data.get('nodes') or []}
+            if data.get('collection_error'):
+                result['error'] = data['collection_error']
+            return result
         except (OSError, ValueError) as error:
-            seen = self.peer_seen.get(host)
-            return {'host': host, 'project': None, 'nodes': [], 'error': f'{self.peers[host]}: {error}',
-                    'last_seen_ago': int(time.monotonic() - seen) if seen is not None else None}
+            return {'host': host, 'project': None, 'nodes': [], 'error': f'{self.peers[host]}: {error}'}
 
     def forward(self, host, method, path, body=None, timeout=STOP_TIMEOUT + 60):
         """Relay an API call to a peer manager using this manager's own token."""
@@ -578,11 +539,20 @@ class Manager:
         container_id, _ = self.locate(name)
         query = '' if action == 'start' else f'?t={STOP_TIMEOUT}'
         self.docker.request('POST', f'/containers/{container_id}/{action}{query}', timeout=STOP_TIMEOUT + 30)
-        return self.inspect(name, container_id)
+        summary = self.inspect(name, container_id, probe=False)
+        summary['sample'] = {'at': None, 'state': 'pending'}
+        with self.lock:
+            self.cache[name] = summary
+            if name in self.schedule:
+                entry = self.schedule[name]
+                entry['revision'] = entry.get('revision', 0) + 1
+                self.forced.add(name)
+                self.wake.set()
+        return summary
 
     def register(self, name, operator_address, submit):
         container_id, details = self.locate(name)
-        summary = self.inspect(name, container_id, details)
+        summary = self.inspect(name, container_id, details, probe=False)
         if summary['role'] != 'node':
             raise ValueError('Only node services can be registered')
         if summary['container']['state'] != 'running':
@@ -617,9 +587,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy',
-                         "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
-                         "font-src 'self' https://fonts.gstatic.com; frame-ancestors 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -655,7 +623,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    if self.token else 'Set MANAGER_TOKEN to serve hosts other than localhost'})
         parts = url.path.split('/')[2:]
         if method == 'GET' and parts == ['nodes']:
-            return self.send(200, self.manager.overview(include_peers=query.get('peers', ['1'])[0] != '0'))
+            return self.send(200, self.manager.overview(query.get('peers') != ['0']))
         if parts[0] == 'hosts':
             return self.relay(method, parts[1:], url.query)
         if len(parts) < 2 or parts[0] != 'nodes' or not NAME.fullmatch(parts[1]):
@@ -663,7 +631,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name, action = parts[1], parts[2] if len(parts) > 2 else None
         if method == 'GET':
             if action is None:
-                return self.send(200, self.manager.inspect(name, *self.manager.locate(name)))
+                return self.send(200, self.manager.cached(name))
             if action == 'logs':
                 tail = query.get('tail', ['200'])[0]
                 if not tail.isdecimal() or not 1 <= int(tail) <= 5000:
@@ -675,6 +643,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.read_body()
         if body is None:
             return
+        if action == 'refresh':
+            return self.send(202, self.manager.refresh(name))
         if action in ('restart', 'stop', 'start'):
             return self.send(200, self.manager.power(name, action))
         if action == 'register':
@@ -707,6 +677,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         host, path = (parts[0] if parts else ''), '/'.join(parts[1:])
         if host not in self.manager.peers or not PEER_PATH.fullmatch(path):
             return self.send(404, {'error': 'Not found'})
+        if method == 'GET' and len(parts) in (2, 3):
+            # Even remote detail views read this manager's saved peer snapshot.
+            with self.manager.lock:
+                peer = copy.deepcopy(self.manager.peer_cache.get(host))
+            if peer is None:
+                return self.send(503, {'error': 'Waiting for peer cache'})
+            if len(parts) == 2:
+                return self.send(200, {**peer, 'peers': []})
+            for node in peer['nodes']:
+                if node['name'] == parts[2]:
+                    return self.send(200, node)
+            return self.send(404, {'error': 'Node not present in peer cache'})
         body = None
         if method == 'POST':
             body = self.read_body()
@@ -769,7 +751,12 @@ def main():
         sys.exit('MANAGER_HOST must be a short name of letters, digits, dots, dashes, or underscores')
     # Always port 8080 inside the container; Compose chooses the host address and port.
     server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-    server.manager = Manager(docker, project, service, host, peers, token)
+    try:
+        interval = int(os.environ.get('MANAGER_POLL_INTERVAL', POLL_INTERVAL))
+        server.manager = Manager(docker, project, service, host, peers, token, interval=interval)
+    except ValueError as error:
+        sys.exit(f'Invalid polling interval: {error}')
+    server.manager.start()
     print(f'Managing Compose project {project} as host {host} on container port {PORT}', flush=True)
     for name, url in peers.items():
         print(f'Peer {name}: {url}', flush=True)
@@ -777,6 +764,9 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        server.manager.close()
+        server.server_close()
 
 
 if __name__ == '__main__':

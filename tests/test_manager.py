@@ -5,13 +5,15 @@ import importlib.util
 import json
 from pathlib import Path
 import socketserver
+import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+import concurrent.futures
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
 
 REPO = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('manager', REPO / 'manager/manager.py')
@@ -19,7 +21,6 @@ manager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(manager)
 
 PROJECT = 'session-node'
-PROBE_MARKER = 'set -uo pipefail'
 NOW = 1_800_000_000
 INFO = {'status': 'OK', 'version': '11.6.1', 'height': 500, 'target_height': 0, 'l2_height': 900,
         'l2_tracker_height': 905, 'start_time': NOW - 3600, 'last_storage_server_ping': NOW - 20,
@@ -46,9 +47,6 @@ CONTAINERS = {
     'manager': ('running', 'healthy', ['ROLE=manager']),
     'peer': ('running', 'healthy', ['ROLE=manager', 'MANAGER_HOST=other']),
 }
-
-
-FINISHED = (datetime.now(timezone.utc) - timedelta(seconds=360)).strftime('%Y-%m-%dT%H:%M:%S.000000000Z')
 
 
 def frames(*chunks):
@@ -96,8 +94,7 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
             details = {'Id': parts[1], 'RestartCount': 2 if name == 'oxen00' else 0,
                        'Config': {'Env': env, 'Image': 'ghcr.io/schwoi/session-node:11.6.1.0'},
                        'State': {'Status': state, 'Running': state == 'running',
-                                 'StartedAt': '2026-09-17T10:00:00.123456789Z',
-                                 'FinishedAt': FINISHED}}
+                                 'StartedAt': '2026-09-17T10:00:00.123456789Z'}}
             if health:
                 details['State']['Health'] = {'Status': health}
             return self.reply(200, details)
@@ -119,9 +116,8 @@ class FakeDocker(http.server.BaseHTTPRequestHandler):
             exec_id = f'exec-{len(self.execs)}'
             self.calls.append(('exec', name, command))
             stderr = b''
-            if 'bash' in command and PROBE_MARKER in command[-1]:
-                # The probe must run in its own process group under a hard deadline.
-                assert command[:2] == ['setsid', '-w'] and command[2] == 'timeout' and 'KILL' in command, command
+            if 'bash' in command and 'set -uo pipefail' in command[-1]:
+                assert command[:4] == ['setsid', '-w', 'timeout', '--signal=KILL'], command
                 output, code = json.dumps(PROBES[name]).encode(), 0
                 stderr = b'curl: (7) Failed to connect to 127.0.0.1 port 22023\n'
             elif 'register' in command:
@@ -170,6 +166,18 @@ class ManagerTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def setUp(self):
+        # Populate snapshots through the collector, never via HTTP requests.
+        self.tick = 1000.0
+        self.server.manager = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager',
+                                              clock=lambda: self.tick)
+        self.peer.manager = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager',
+                                            host='remote', token='secret', clock=lambda: self.tick)
+        for instance in (self.server.manager, self.peer.manager):
+            instance.discover()
+            for entry in instance.schedule.values():
+                entry['due'] = self.tick
+            while instance.collect_one():
+                self.tick += manager.PROBE_GAP
         FakeDocker.calls.clear()
         self.server.manager.token = ''
         self.server.manager.peers = {}
@@ -207,14 +215,8 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(oxen['node']['pubkey'], 'ab' * 32)
         self.assertEqual(oxen['node']['pings'], {'oxen-storage': 20, 'lokinet': 900, 'session-router': 30})
         self.assertTrue(oxen['node']['service_node']['registered'])
-        self.assertEqual([(p['name'], p['stale'], p['reported_ago']) for p in oxen['processes']],
-                         [('oxend', False, None), ('oxen-storage', False, 20), ('lokinet', True, 900), ('session-router', True, 30)])
-        self.assertEqual(oxen['node']['behind'], 0)
-        self.assertEqual((nodes['l2proxy']['node']['behind'], nodes['l2proxy']['node']['lagging']), (120, True))
-        self.assertFalse(oxen['node']['lagging'])
-        self.assertEqual(oxen['problems'], ['session-router not running', 'lokinet not reporting (15m)'])
-        self.assertEqual((oxen['state'], oxen['reason'], oxen['needs_attention']),
-                         ('degraded', 'session-router not running', True))
+        self.assertEqual([p['name'] for p in oxen['processes']], ['oxend', 'oxen-storage', 'lokinet', 'session-router'])
+        self.assertEqual(oxen['problems'], ['session-router is not running', 'lokinet last reported 15 minutes ago'])
         self.assertEqual(oxen['node']['peers'], {'inbound': 3, 'outbound': 8})
         self.assertEqual(oxen['connections'], {'inbound': 10, 'outbound': 9, 'services': {
             'p2p': {'inbound': 3, 'outbound': 8}, 'quorumnet': {'inbound': 2, 'outbound': 0},
@@ -225,18 +227,13 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(proxy['container']['health'], 'starting')
         self.assertIsNone(proxy['node']['service_node'])
         self.assertEqual(proxy['node']['pings'], {})
-        # 120 blocks behind a 620 target is initial sync: expected, so nothing else is reported.
-        self.assertEqual((proxy['state'], proxy['reason'], proxy['needs_attention']), ('syncing', 'syncing 80.6%', False))
-        self.assertEqual(proxy['sync'], {'percent': 80.6, 'remaining': 120, 'height': 500, 'target': 620, 'recalled': False, 'registered': False})
-        self.assertEqual((proxy['problems'], proxy['suppressed']), ([], []))
+        self.assertEqual(proxy['problems'], ['Docker health check: starting', 'Blockchain is 120 blocks behind'])
         stagenet = nodes['stagenet00']
         self.assertIsNone(stagenet['node'])
-        self.assertEqual(stagenet['problems'], ['stopped 6m ago'])
-        self.assertEqual((stagenet['state'], stagenet['reason']), ('stopped', 'stopped 6m ago'))
-        self.assertIsNone(stagenet['container']['uptime'])
-        self.assertTrue(360 <= stagenet['container']['stopped_ago'] <= 600)  # FINISHED is fixed at import time
+        self.assertEqual(stagenet['problems'], ['Container is exited'])
+        self.assertEqual(stagenet['container']['uptime'], None)
         probes = [call for call in FakeDocker.calls if call[0] == 'exec']
-        self.assertEqual(sorted(call[1] for call in probes), ['l2proxy', 'oxen00'])
+        self.assertEqual(probes, [])  # A dashboard read cannot trigger node work.
 
     def test_single_node_and_unknown(self):
         status, payload = self.request('/api/nodes/oxen00')
@@ -340,6 +337,8 @@ class ManagerTests(unittest.TestCase):
         auth = {'Authorization': 'Bearer secret'}
         self.server.manager.token = 'secret'
         self.server.manager.peers = {'remote': f'http://127.0.0.1:{self.peer.server_port}', 'down': 'http://127.0.0.1:9'}
+        for host in self.server.manager.peers:
+            self.server.manager.peer_cache[host] = self.server.manager.peer_overview(host)
         status, payload = self.request('/api/nodes', headers=auth)
         self.assertEqual(status, 200)
         self.assertEqual(payload['host'], 'local')
@@ -348,11 +347,6 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual([node['name'] for node in remote['nodes']], ['l2proxy', 'oxen00', 'stagenet00'])
         self.assertEqual((down['host'], down['nodes']), ('down', []))
         self.assertIn('127.0.0.1:9', down['error'])
-        self.assertIsNone(down['last_seen_ago'])
-        # A peer that answered once reports how long ago that was when it later fails.
-        self.server.manager.peer_seen['down'] = manager.time.monotonic() - 120
-        _, payload = self.request('/api/nodes', headers=auth)
-        self.assertTrue(120 <= payload['peers'][1]['last_seen_ago'] <= 125)
         status, payload = self.request('/api/hosts/remote/nodes/oxen00', headers=auth)
         self.assertEqual((status, payload['name'], payload['node']['pubkey']), (200, 'oxen00', 'ab' * 32))
         status, text = self.request('/api/hosts/remote/nodes/oxen00/logs?tail=5', headers=auth)
@@ -373,121 +367,14 @@ class ManagerTests(unittest.TestCase):
         for path in ('/api/hosts/unknown/nodes', '/api/hosts/remote/exec', '/api/hosts/remote/nodes/oxen00/kill',
                      '/api/hosts/remote/nodes/../x', '/api/hosts'):
             self.assertEqual(self.request(path, headers=auth)[0], 404, path)
-        self.assertEqual(self.request('/api/hosts/down/nodes', headers=auth)[0], 502)
+        self.assertEqual(self.request('/api/hosts/down/nodes', headers=auth)[0], 200)
         # The peer accepts only the shared token; a hub with the wrong token is rejected by the peer.
         self.server.manager.token = 'other'
+        self.server.manager.peer_cache['remote'] = self.server.manager.peer_overview('remote')
         status, payload = self.request('/api/nodes', headers={'Authorization': 'Bearer other'})
         self.assertEqual(status, 200)
         self.assertIn('MANAGER_TOKEN', payload['peers'][0]['error'])
-        self.assertEqual(self.request('/api/hosts/remote/nodes', headers={'Authorization': 'Bearer other'})[0], 401)
-
-    def test_syncing_suppresses_incidental_problems(self):
-        summary = {'role': 'node', 'container': {'state': 'running', 'health': 'unhealthy'}, 'processes': [],
-                   'node': {'rpc_ok': True, 'height': 1395229, 'target_height': 2201613, 'behind': 806384,
-                            'lagging': True, 'pings': {'lokinet': None}, 'l2_tracker_height': 5, 'l2_height': 9,
-                            'service_node': None},
-                   'sync': {'percent': 63.4, 'remaining': 806384, 'recalled': False}}
-        found = manager.problems(summary)
-        self.assertEqual(found, ['health check failing', 'lokinet never reported', '806384 blocks behind', 'L2 tracker 4 blocks behind'])
-        self.assertEqual(manager.assess(summary, found), {
-            'state': 'syncing', 'reason': 'syncing 63.4%', 'needs_attention': False,
-            'suppressed': ['health check failing', 'lokinet never reported', 'L2 tracker 4 blocks behind']})
-        summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': True, 'age': 40}
-        summary['node'] = None
-        recalled = manager.assess(summary)
-        self.assertEqual(recalled['reason'], 'syncing 63.4% · RPC busy')
-        self.assertNotIn('oxend RPC unreachable', recalled['suppressed'])  # already said by "RPC busy"
-        # A registered node catching up shows the same progress but stays in the attention list.
-        summary['sync'] = {'percent': 63.4, 'remaining': 806384, 'recalled': False, 'registered': True}
-        risky = manager.assess(summary)
-        self.assertEqual((risky['state'], risky['reason'], risky['needs_attention']),
-                         ('syncing', 'syncing 63.4% · registered node at risk', True))
-        self.assertIsNone(manager.sync_progress(2201600, 2201613))  # a few blocks behind is lag, not sync
-        self.assertIsNone(manager.sync_progress(5, 0))
-        self.assertEqual(manager.sync_progress(1000, 2000), (50.0, 1000))
-
-    def test_sync_memory_covers_busy_rpc(self):
-        mgr = self.server.manager
-        running = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 1000, 'target_height': 2000}}
-        self.assertEqual(mgr.sync_state('c1', running), {'percent': 50.0, 'remaining': 1000, 'height': 1000, 'target': 2000, 'recalled': False, 'registered': False})
-        busy = {'container': {'state': 'running'}, 'node': None}
-        recalled = mgr.sync_state('c1', busy)
-        self.assertEqual((recalled['percent'], recalled['recalled'], recalled['registered']), (50.0, True, False))
-        registered = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 1000, 'target_height': 2000,
-                                                                    'service_node': {'registered': True}}}
-        self.assertTrue(mgr.sync_state('c2', registered)['registered'])
-        self.assertTrue(mgr.sync_state('c2', busy)['registered'])  # remembered along with the heights
-        self.assertIsNone(mgr.sync_state('unknown', busy))
-        # With no memory yet, a fresh "Synced H/T" line from oxend's log is enough.
-        logged = mgr.sync_state('c3', busy, {'height': 400, 'target': 2000, 'age': 12})
-        self.assertEqual((logged['percent'], logged['remaining'], logged['recalled'], logged['age']), (20.0, 1600, True, 12))
-        self.assertIsNone(mgr.sync_state('c4', busy, {'height': 400, 'target': 2000, 'age': 5000}))  # stale line
-        self.assertIsNone(mgr.sync_state('c4', busy, {'height': 1990, 'target': 2000, 'age': 3}))  # caught up
-        self.assertEqual(mgr.sync_state('c3', busy)['percent'], 20.0)  # the log reading is remembered too
-        synced = {'container': {'state': 'running'}, 'node': {'rpc_ok': True, 'height': 2000, 'target_height': 2000}}
-        self.assertIsNone(mgr.sync_state('c1', synced))
-        self.assertIsNone(mgr.sync_state('c1', busy))  # memory cleared once the node caught up
-        mgr.sync_state('c1', running)
-        mgr.sync_memory['c1'] = (1000, 2000, manager.time.monotonic() - manager.SYNC_MEMORY - 1, False)
-        self.assertIsNone(mgr.sync_state('c1', busy))  # too old to trust
-        self.assertNotIn('c1', mgr.sync_memory)  # and forgotten, not kept forever
-        self.assertIsNone(mgr.sync_state('c1', {'container': {'state': 'exited'}, 'node': None}))
-        self.assertNotIn('c1', mgr.sync_memory)
-
-    def test_probe_runs_once_per_container_at_a_time(self):
-        mgr = self.server.manager
-        lock = mgr.probe_locks.setdefault('busy.container', manager.threading.Lock())
-        lock.acquire()
-        try:
-            self.assertIsNone(mgr.probe('busy.container'))  # skipped, not queued behind the running one
-        finally:
-            lock.release()
-        self.assertEqual([c for c in FakeDocker.calls if c[0] == 'exec' and c[1] == 'busy'], [])
-        self.assertIsNotNone(mgr.probe('oxen00.container'))
-        self.assertFalse(mgr.probe_locks['oxen00.container'].locked())
-
-    def test_state_for_recreated_containers_is_pruned(self):
-        mgr = self.server.manager
-        mgr.sync_memory['gone.container'] = (1, 2, manager.time.monotonic(), False)
-        mgr.probe_locks['gone.container'] = manager.threading.Lock()
-        held = manager.threading.Lock(); held.acquire()
-        mgr.probe_locks['gone-but-probing.container'] = held
-        try:
-            mgr.nodes()
-            self.assertNotIn('gone.container', mgr.sync_memory)
-            self.assertNotIn('gone.container', mgr.probe_locks)
-            self.assertIn('gone-but-probing.container', mgr.probe_locks)  # kept while its probe runs
-            self.assertIn('oxen00.container', mgr.probe_locks)
-        finally:
-            held.release()
-            mgr.probe_locks.pop('gone-but-probing.container', None)
-
-    def test_overview_is_coalesced_and_peers_do_not_recurse(self):
-        mgr = self.server.manager
-        mgr.overview_cache = (0.0, None)
-        first = mgr.overview()
-        probes = len([c for c in FakeDocker.calls if c[0] == 'exec'])
-        second = mgr.overview()
-        self.assertEqual(first['nodes'], second['nodes'])
-        self.assertEqual(len([c for c in FakeDocker.calls if c[0] == 'exec']), probes)  # served from cache
-        mgr.overview_cache = (manager.time.monotonic() - manager.OVERVIEW_CACHE - 1, first['nodes'])
-        mgr.overview()
-        self.assertGreater(len([c for c in FakeDocker.calls if c[0] == 'exec']), probes)  # expired: a new round
-        # A peer asked for its nodes answers without fanning out to its own peers.
-        self.server.manager.token = 'secret'
-        self.peer.manager.peers = {'loop': f'http://127.0.0.1:{self.server.server_port}'}
-        try:
-            status, payload = self.request('/api/nodes?peers=0', headers={'Authorization': 'Bearer secret'})
-            self.assertEqual((status, payload['peers']), (200, []))
-            self.server.manager.peers = {'remote': f'http://127.0.0.1:{self.peer.server_port}'}
-            self.server.manager.overview_cache = (0.0, None)
-            status, payload = self.request('/api/nodes', headers={'Authorization': 'Bearer secret'})
-            self.assertEqual(status, 200)
-            remote, = payload['peers']
-            self.assertIsNone(remote.get('error'))
-            self.assertNotIn('peers', remote)  # the peer's own peer list is never relayed
-        finally:
-            self.peer.manager.peers = {}
+        self.assertIn('MANAGER_TOKEN', self.request('/api/hosts/remote/nodes', headers={'Authorization': 'Bearer other'})[1]['error'])
 
     def test_parse_peers(self):
         self.assertEqual(manager.parse_peers(''), {})
@@ -497,6 +384,124 @@ class ManagerTests(unittest.TestCase):
                     'a=http://x:8080/x', 'a=http://x:8080/api', 'a=http://x#frag'):
             with self.assertRaises(ValueError):
                 manager.parse_peers(bad)
+
+    def test_concurrent_dashboard_reads_and_cycles_do_no_work(self):
+        instance = self.server.manager
+        instance.token = 'secret'
+        instance.peers = {'remote': f'http://127.0.0.1:{self.peer.server_port}'}
+        self.peer.manager.peers = {'local': self.base}  # Cyclic peer configuration.
+        instance.peer_cache['remote'] = instance.peer_overview('remote')
+        paths = ['/api/nodes', '/api/nodes?peers=0', '/api/nodes/oxen00',
+                 '/api/hosts/remote/nodes', '/api/hosts/remote/nodes/oxen00']
+        with patch.object(instance.docker, 'request', side_effect=AssertionError('read hit Docker')), \
+                patch.object(self.peer.manager.docker, 'request', side_effect=AssertionError('peer read hit Docker')), \
+                patch.object(instance, 'forward', side_effect=AssertionError('read hit peer')):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda p: self.request(p, headers={'Authorization': 'Bearer secret'}), paths * 5))
+        self.assertTrue(all(status == 200 for status, _ in results))
+        self.assertEqual(FakeDocker.calls, [])
+
+    def test_staggered_collection_and_no_catchup_burst(self):
+        instance = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager', clock=lambda: self.tick)
+        instance.discover()
+        self.assertEqual([e['due'] - self.tick for e in instance.schedule.values()], [0, 100, 200])
+        self.assertTrue(instance.collect_one())
+        self.assertFalse(instance.collect_one())
+        self.tick += 99
+        self.assertFalse(instance.collect_one())
+        self.tick += 1
+        self.assertTrue(instance.collect_one())
+        self.tick += 100
+        self.assertTrue(instance.collect_one())
+        self.tick += 100
+        self.assertTrue(instance.collect_one())
+        calls = [call[1] for call in FakeDocker.calls if call[0] == 'exec']
+        self.assertEqual(calls, ['l2proxy', 'oxen00', 'l2proxy'])
+        self.tick += 3600
+        self.assertTrue(instance.collect_one())
+        self.assertFalse(instance.collect_one())
+        self.assertTrue(all(e['due'] > self.tick for n, e in instance.schedule.items()
+                            if n == 'oxen00'))
+
+    def test_refresh_is_queued_deduplicated_and_rate_limited(self):
+        instance = self.server.manager
+        self.tick += 31
+        self.assertEqual(self.request('/api/nodes/oxen00/refresh')[0], 404)
+        self.assertEqual(self.request('/api/nodes/oxen00/refresh', {}, method='POST')[0], 403)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.mutate('/api/nodes/oxen00/refresh'), range(12)))
+        self.assertEqual(sum(data['refresh'] == 'queued' for _, data in results), 1)
+        self.assertEqual(FakeDocker.calls, [])
+        entered, release = threading.Event(), threading.Event()
+        original = instance.inspect
+
+        def slow(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return original(*args, **kwargs)
+
+        with patch.object(instance, 'inspect', side_effect=slow):
+            worker = threading.Thread(target=instance.collect_one)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(instance.collect_one())
+            self.assertEqual(instance.refresh('oxen00')['refresh'], 'already queued')
+            self.assertEqual(self.request('/api/nodes/oxen00')[0], 200)
+            release.set()
+            worker.join(5)
+        self.assertEqual(instance.refresh('oxen00')['refresh'], 'cooldown')
+        self.assertEqual(len([c for c in FakeDocker.calls if c[0] == 'exec']), 1)
+
+    def test_failed_collection_does_not_retry_on_reads(self):
+        instance = self.server.manager
+        self.tick += 31
+        instance.refresh('oxen00')
+        with patch.object(instance, 'inspect', side_effect=OSError('probe unavailable')):
+            self.assertTrue(instance.collect_one())
+        for _ in range(3):
+            status, data = self.request('/api/nodes/oxen00')
+            self.assertEqual(status, 200)
+            self.assertEqual(data['sample']['state'], 'failed')
+        self.assertFalse(instance.collect_one())
+        self.assertEqual(FakeDocker.calls, [])
+
+    def test_cold_cache_does_not_probe_on_read(self):
+        self.server.manager = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager')
+        with patch.object(self.server.manager.docker, 'request', side_effect=AssertionError('cold read hit Docker')):
+            self.assertEqual(self.request('/api/nodes')[1]['nodes'], [])
+            self.assertEqual(self.request('/api/nodes/oxen00')[0], 404)
+
+    def test_removed_and_recreated_nodes_invalidate_samples(self):
+        instance = self.server.manager
+        with patch.object(instance, 'containers', return_value={'oxen00': 'new-id'}):
+            details = instance.details('oxen00', 'oxen00.container')
+            with patch.object(instance, 'details', return_value=details):
+                instance.discover()
+        self.assertEqual([n['name'] for n in instance.nodes()], ['oxen00'])
+        self.assertIsNone(instance.cached('oxen00')['sample']['at'])
+        self.assertIsNone(instance.cached('oxen00')['node'])
+
+    def test_connection_scan_handles_ipv4_ipv6_and_listener_order(self):
+        # Run the actual probe's connection parser against kernel-format fixtures.
+        parser = manager.PROBE.split('conns=$(\n', 1)[1].split('\njq -cn --argjson info', 1)[0]
+        with tempfile.TemporaryDirectory() as temp:
+            tcp = Path(temp) / 'tcp'
+            tcp6 = Path(temp) / 'tcp6'
+            tcp.write_text('sl local_address rem_address st\n'
+                           '0: 0100000A:5606 0200000A:C001 01\n'
+                           '1: 00000000:5606 00000000:0000 0A\n'
+                           '2: 0100000A:C002 0200000A:5606 01\n'
+                           '3: 0100000A:5606 0100007F:C003 01\n')
+            tcp6.write_text('sl local_address rem_address st\n'
+                            '0: 00000000000000000000000000000000:5609 20010DB8000000000000000000000001:C004 01\n'
+                            '1: 00000000000000000000000000000000:5609 00000000000000000000000000000000:0000 0A\n'
+                            '2: 00000000000000000000000000000000:5609 00000000000000000000000001000000:C005 01\n')
+            command = ('conns=$(\n' + parser + '\nprintf "%s" "$conns"').replace('/proc/net/tcp6', str(tcp6)).replace('/proc/net/tcp', str(tcp))
+            result = subprocess.run(['bash', '-c', command], capture_output=True, text=True, check=True)
+        rows = sorted(json.loads(result.stdout), key=lambda r: (r['direction'], r['port']))
+        self.assertEqual(rows, [{'direction': 'in', 'port': 22022, 'count': 1},
+                                {'direction': 'in', 'port': 22025, 'count': 1},
+                                {'direction': 'out', 'port': 22022, 'count': 1}])
 
     def test_helpers(self):
         stream = manager.demux(frames((1, b'a'), (2, b'b'), (1, b'c')))
@@ -514,18 +519,10 @@ class ManagerTests(unittest.TestCase):
         summary = {'role': 'node', 'container': {'state': 'running', 'health': 'unhealthy'},
                    'node': node, 'processes': []}
         self.assertEqual(manager.problems(summary), [
-            'health check failing', 'oxen-storage never reported', 'lokinet never reported',
-            'session-router never reported'])
+            'Docker health check: unhealthy', 'oxen-storage has never reported to oxend',
+            'lokinet has never reported to oxend', 'session-router has never reported to oxend'])
         summary['node'] = None
-        self.assertEqual(manager.problems(summary), ['health check failing', 'oxend RPC unreachable'])
-        self.assertEqual(manager.assess(summary), {'state': 'degraded', 'reason': 'health check failing', 'needs_attention': True, 'suppressed': []})
-        summary['container'] = {'state': 'running', 'health': 'starting'}
-        summary['node'] = {'rpc_ok': True, 'pings': {}, 'behind': 0, 'lagging': False,
-                           'l2_tracker_height': None, 'l2_height': None, 'service_node': None}
-        self.assertEqual(manager.assess(summary), {'state': 'healthy', 'reason': 'starting', 'needs_attention': False, 'suppressed': []})
-        summary['container'] = {'state': 'exited', 'health': None, 'stopped_ago': 4000}
-        self.assertEqual(manager.assess(summary), {'state': 'stopped', 'reason': 'stopped 1h 6m ago', 'needs_attention': True, 'suppressed': []})
-        self.assertEqual([manager.ago(s) for s in (5, 61, 3660, 90000)], ['5s', '1m', '1h 1m', '1d 1h'])
+        self.assertEqual(manager.problems(summary), ['Docker health check: unhealthy', 'oxend RPC is unreachable'])
         ports = manager.service_ports({'P2P_PORT': '11032', 'QUORUMNET_PORT': 'bad'}, 'stagenet')
         self.assertEqual(ports, {11032: 'p2p', 22020: 'storage', 22021: 'storage https'})
         self.assertEqual(manager.service_ports({}, 'mainnet'), {22022: 'p2p', 22025: 'quorumnet', 22020: 'storage', 22021: 'storage https'})
