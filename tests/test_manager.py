@@ -890,6 +890,7 @@ class ManagerTests(unittest.TestCase):
             manager.identify(docker, 'e10773777f0a')
         self.assertIn('e10773777f0a', str(stopped.exception))
         self.assertIn('DOCKER_SOCKET', str(stopped.exception))
+        self.assertIn(self.socket_path, str(stopped.exception))  # names the socket actually in use
 
     def test_parse_peers(self):
         self.assertEqual(manager.parse_peers(''), {})

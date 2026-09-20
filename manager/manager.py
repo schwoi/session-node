@@ -1128,9 +1128,9 @@ def identify(docker, container=None):
     try:
         labels = docker.call('GET', f'/containers/{container}/json')['Config'].get('Labels') or {}
     except DockerError as error:
-        sys.exit(f'Docker does not know this container ({container}): {error}. The socket mounted at '
-                 f'/var/run/docker.sock may belong to a different daemon than the one running the manager '
-                 f'(rootless versus rootful: set DOCKER_SOCKET), or set MANAGER_PROJECT explicitly.')
+        sys.exit(f'Docker does not know this container ({container}): {error}. The socket at {docker.path} '
+                 f'may belong to a different daemon than the one running the manager (rootless versus '
+                 f'rootful: point DOCKER_SOCKET at the right one), or set MANAGER_PROJECT explicitly.')
     project = labels.get('com.docker.compose.project')
     if not project:
         sys.exit('Set MANAGER_PROJECT when not running as a Docker Compose service')
