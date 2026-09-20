@@ -1074,9 +1074,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status, content_type, payload = self.manager.forward(host, method, path, body)
         except OSError as error:
             return self.send(502, {'error': f'Peer {host} unreachable: {error}'})
-        if method == 'POST' and status == 200 and action in ('restart', 'stop', 'start', 'refresh'):
-            # The peer just re-sampled that node; pick the result up before answering so the
-            # dashboard's next read shows it. The action itself succeeded, so this is best effort.
+        if method == 'POST' and status in (200, 202) and action in ('restart', 'stop', 'start', 'refresh'):
+            # The peer re-sampled that node (202: the action is done, its sample still pending); pick
+            # the result up before answering so the dashboard's next read shows it. The action itself
+            # succeeded, so this is best effort.
             try:
                 self.manager.refresh_peer(host, invalidate=True)
             except (NotFound, DockerError, OSError) as error:

@@ -480,6 +480,17 @@ class ManagerTests(unittest.TestCase):
                      '/api/hosts/remote/nodes/../x', '/api/hosts'):
             self.assertEqual(self.request(path, headers=auth)[0], 404, path)
         self.assertEqual(self.request('/api/hosts/down/nodes', headers=auth)[0], 502)
+        # A peer whose post-action sample has not landed answers 202; the hub still re-fetches it.
+        fetched = self.request('/api/nodes', headers=auth)[1]['peers'][1]['sample']['at']
+        original = manager.REFRESH_WAIT
+        manager.REFRESH_WAIT = 0
+        try:
+            status, payload = self.request('/api/hosts/remote/nodes/oxen00/restart', {},
+                                           {**auth, 'X-Requested-With': 'session-node-manager'}, 'POST')
+        finally:
+            manager.REFRESH_WAIT = original
+        self.assertEqual((status, payload['name']), (202, 'oxen00'))
+        self.assertNotEqual(self.request('/api/nodes', headers=auth)[1]['peers'][1]['sample']['at'], fetched)
         # The peer accepts only the shared token; a hub with the wrong token is rejected by the peer.
         self.server.manager.token = 'other'
         self.server.manager.refresh_peer('remote')
