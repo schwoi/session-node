@@ -15,18 +15,20 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   # Increment for container changes that keep the same upstream node version.
   IMAGE_REVISION: "0"
-  # Management dashboard image; versioned independently of the node packages.
-  MANAGER_VERSION: "0.1.0"
+  # The management image's version lives in manager/VERSION, so bumping it is a
+  # manager-only change and does not republish the node image.
 
 jobs:
-  # Each image is published only when its own inputs changed, so a manager release
-  # never republishes the node image (and vice versa). The node image is also built
-  # only then; the manager image is cheap and is always built for the tests, but pushed
-  # only when its inputs changed. The node image's inputs
-  # are its build context (Dockerfile, entrypoint.sh, healthcheck.sh, as selected by
+  # Each image is published only when its own inputs changed, so a manager-only change
+  # never republishes the node image (and vice versa). The node image's inputs are its
+  # build context (Dockerfile, entrypoint.sh, healthcheck.sh, as selected by
   # .dockerignore) plus .dockerignore itself and this workflow, which holds the build
-  # recipe and IMAGE_REVISION; the manager image's inputs are the manager directory and
-  # this workflow. The weekly schedule exists to pick up new node packages, so it always
+  # recipe and IMAGE_REVISION; the manager image's inputs are the manager directory
+  # (including manager/VERSION) and this workflow. Editing this workflow therefore
+  # republishes both. When the node inputs did not change, the tests run against the
+  # published node image, building a throwaway one only if none is published yet; the
+  # manager image is cheap and is always built for the tests, but pushed only when its
+  # inputs changed. The weekly schedule exists to pick up new node packages, so it always
   # rebuilds the node image; a manual run rebuilds both.
   changes:
     runs-on: ubuntu-latest
@@ -190,6 +192,17 @@ jobs:
             type=raw,value=${{ steps.version.outputs.node_version }},enable={{is_default_branch}}
             type=sha
 
+      - name: Read management image version
+        id: manager_version
+        if: needs.changes.outputs.manager == 'true'
+        run: |
+          version=$(tr -d '[:space:]' < manager/VERSION)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::manager/VERSION must be MAJOR.MINOR.PATCH, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Generate management image tags
         id: manager_meta
         if: needs.changes.outputs.manager == 'true'
@@ -198,7 +211,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-manager
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ env.MANAGER_VERSION }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.manager_version.outputs.version }},enable={{is_default_branch}}
             type=sha
 
       # Publish the exact images inspected above, avoiding a second build that

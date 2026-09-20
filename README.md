@@ -28,11 +28,12 @@ can refresh dependencies under the same tags; use an image digest when you need
 an exact, immutable build. Each image is published only when its own inputs
 change: the node image when `Dockerfile`, `entrypoint.sh`, `healthcheck.sh`,
 `.dockerignore`, or the workflow file change, and on the weekly schedule; the
-manager image when the `manager` directory or the workflow file changes. The
-node image is also built only then (other runs test against the published
-one); the manager image is always built for the tests. A manual workflow run
-rebuilds and publishes both. A manager release therefore never republishes the
-node image, and `docker compose pull` leaves an unchanged node image alone.
+manager image when the `manager` directory (its version is `manager/VERSION`)
+or the workflow file changes. Other runs test against the published node image
+and build a throwaway one only if none is published yet; the manager image is
+always built for the tests. A manual workflow run rebuilds and publishes both.
+A manager-only change therefore never republishes the node image, and
+`docker compose pull` leaves an unchanged node image alone.
 
 After publication, select a version by setting this in `.env` and pulling it:
 
