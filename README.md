@@ -27,7 +27,7 @@ CI also publishes the `11.6.1`, `latest`, and commit-SHA aliases. Scheduled rebu
 can refresh dependencies under the same tags; use an image digest when you need
 an exact, immutable build. Each image is published only when its own inputs
 change: the node image when `Dockerfile`, `entrypoint.sh`, `healthcheck.sh`,
-`.dockerignore`, or the workflow file change, and on the weekly schedule; the
+`.dockerignore`, or the workflow file changes, and on the weekly schedule; the
 manager image when the `manager` directory (its version is `manager/VERSION`)
 or the workflow file changes. Other runs test against the published node image
 and build a throwaway one only if none is published yet; the manager image is
