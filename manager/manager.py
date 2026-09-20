@@ -679,7 +679,7 @@ class Collector:
             if reported.get('age') is not None and age is not None:
                 reported['age'] += age
                 if reported.get('status') == 'ok':
-                    reported['status'] = self.freshness('node', reported['age'])
+                    reported['status'] = self.freshness('node', reported['age'], data.get('interval'))
             node['sample'] = reported
             nodes.append(node)
         view = {'host': name, 'project': data.get('project'), 'nodes': nodes, 'sample': sample,
@@ -688,8 +688,9 @@ class Collector:
             view['error'] = f'{self.manager.peers.get(name, name)}: {entry.error}'
         return view
 
-    def freshness(self, kind, age):
-        return 'stale' if age is not None and age >= STALE_ROUNDS * self.intervals[kind] else 'ok'
+    def freshness(self, kind, age, interval=None):
+        interval = interval or self.intervals[kind]
+        return 'stale' if age is not None and age >= STALE_ROUNDS * interval else 'ok'
 
 
 def parse_peers(value):
@@ -892,7 +893,10 @@ class Manager:
         data = json.loads(payload)
         if status != 200 or not isinstance(data, dict):
             raise ValueError(data.get('error') if isinstance(data, dict) else f'HTTP {status}')
-        return {'project': data.get('project'), 'nodes': data.get('nodes') or []}
+        # The peer's own interval decides when its samples count as stale, not this hub's.
+        interval = (data.get('polling') or {}).get('interval')
+        return {'project': data.get('project'), 'nodes': data.get('nodes') or [],
+                'interval': interval if isinstance(interval, int) and interval > 0 else None}
 
     def forward(self, host, method, path, body=None, timeout=STOP_TIMEOUT + 60):
         """Relay an API call to a peer manager using this manager's own token."""

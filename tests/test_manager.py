@@ -719,6 +719,14 @@ class ManagerTests(unittest.TestCase):
         clock.advance(45)
         remote = mgr.overview()['peers'][1]
         self.assertTrue(45 <= remote['nodes'][1]['sample']['age'] <= 75, remote['nodes'][1]['sample'])
+        # Staleness of a remote node follows the peer's own interval (3600s here), not this hub's 300s.
+        collector.entries[('peer', 'remote')].ok_at -= 700
+        remote = mgr.overview()['peers'][1]
+        self.assertTrue(remote['nodes'][1]['sample']['age'] >= 745)
+        self.assertEqual((remote['nodes'][1]['sample']['status'], remote['sample']['status']), ('ok', 'stale'))
+        collector.entries[('peer', 'remote')].data['interval'] = None  # an older peer that does not say: fall back
+        self.assertEqual(mgr.overview()['peers'][1]['nodes'][1]['sample']['status'], 'stale')
+        collector.entries[('peer', 'remote')].ok_at += 700
         # When the peer goes away its last listing stays, marked failed, with when it was last seen.
         mgr.peers['remote'] = 'http://127.0.0.1:9'
         mgr.collector.request(('peer', 'remote'), invalidate=True)
