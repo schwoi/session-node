@@ -30,6 +30,9 @@ services:
       # Multi-server dashboard: name shown for this host, and peer managers to include.
       - MANAGER_HOST=${MANAGER_HOST:-local}
       - MANAGER_PEERS=${MANAGER_PEERS:-}
+      # Node samples every 5 minutes (spread out, one at a time); peer listings every minute.
+      - MANAGER_POLL_INTERVAL=${MANAGER_POLL_INTERVAL:-300}
+      - MANAGER_PEER_INTERVAL=${MANAGER_PEER_INTERVAL:-60}
 
   # ── L2 Proxy ───────────────────────────────────────────────────
   # Runs oxend as an L2 proxy that forwards Arbitrum data to service nodes.

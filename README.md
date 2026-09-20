@@ -182,6 +182,8 @@ Keep `.env` private; it is ignored by Git. Environment values are visible to use
 | `MANAGER_BIND` / `MANAGER_PORT` | `127.0.0.1` / `8080` | Host address and port publishing the dashboard |
 | `MANAGER_HOST` | `local` | Name of this server on a multi-server dashboard |
 | `MANAGER_PEERS` | Empty | `name=http://mesh-address:8080` entries for other servers' managers |
+| `MANAGER_POLL_INTERVAL` | `300` | Seconds between two samples of the same node (see [Polling and caching](#polling-and-caching)) |
+| `MANAGER_PEER_INTERVAL` | `60` | Seconds between two fetches of a peer manager's cached listing |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker Engine socket mounted into the manager |
 
 Compose also accepts `STAGENET_L2_PROVIDER` for its stagenet services and `SESSION_NODE_IMAGE` to override the image tag. It passes `L2_PROVIDER` from `.env` to both mainnet services and the proxy.
@@ -301,6 +303,17 @@ port, image and version, identity, and staking state. Actions: logs,
 of selected rows, and registration for staking. The layout targets desktop
 widths; on narrow screens the table scrolls sideways.
 
+Every row carries the age of the sample it shows, next to its status. The tag
+says which kind of sample it is: fresh (just its age, for example `3m`),
+**updating…** (a new sample is queued or running; the row keeps showing the
+previous one meanwhile), **failed** (the last attempt could not read the
+container at all, typically a Docker socket error, so the row keeps the last
+good sample and the drawer shows the error), or **stale** (the manager missed
+a round, so the sample is at least two intervals old). A service that has not
+been sampled since the manager started shows as **pending** and does not count
+as needing attention. **Update now**, in the row's overflow menu and in the
+drawer, samples one service ahead of schedule.
+
 ```bash
 docker compose up -d --no-build manager
 # then open http://127.0.0.1:8080
@@ -332,6 +345,44 @@ the API, and state-changing requests require a custom request header that
 browsers cannot add cross-origin. On rootless Docker, set `DOCKER_SOCKET` to the
 user's daemon socket, typically `/run/user/UID/docker.sock`.
 
+### Polling and caching
+
+The manager never probes a node because somebody opened the dashboard. One
+background thread samples the nodes of this host in turn, each once every
+`MANAGER_POLL_INTERVAL` seconds (five minutes by default), with the nodes
+spread evenly across the interval: eight nodes on the default interval means
+one probe roughly every 37 seconds and never two probes at once. The L2 proxy
+is a node like any other here. When a probe overruns, or the host was
+suspended, the missed slots are skipped rather than caught up, so a slow node
+can never trigger a burst of probes. A service that was just created or
+recreated is sampled in the next round without waiting for its slot.
+
+Everything the dashboard and the JSON API read comes from that thread's cache:
+`GET /api/nodes` and `GET /api/nodes/NAME` return the latest sample and its
+`sample` block (`age` in seconds, `status` of `ok`, `stale`, `failed`, or
+`pending`, `pending` while a newer sample is on its way, and the `error` of a
+failed attempt). Opening ten browsers, or ten hubs listing this host as a peer,
+does not add a single probe. The browser re-reads the cache every 15 seconds,
+which is why the page shows "page loaded" separately from each row's sample age.
+
+`POST /api/nodes/NAME/refresh` is the "Update now" action. It queues a sample
+on the same thread, so it cannot overlap the scheduled round; requests for a
+node that is already queued or being sampled share that one sample; and a
+request that follows a finished sample of the same node by less than 30 seconds
+is refused with HTTP 429 and a `retry_after`. Restart, stop, and start use the
+same path: the response is the sample taken after the action (HTTP 202 instead
+of 200 in the rare case that sample is still pending when the request times
+out, with `sample.pending` set), and a sample that
+was already running when the action began is discarded rather than allowed to
+overwrite the newer state. The same rule protects against a probe that started
+in a container instance which has since been recreated.
+
+The cache lives in the manager's memory. After the manager restarts, every
+service shows as pending until its first sample arrives; the first round runs
+back to back rather than waiting for slots, so a host with eight nodes is fully
+populated within a minute. Run exactly one manager per Compose project: two
+would double the probe load, and each would answer with its own cache.
+
 ### Several servers on one dashboard
 
 Each server keeps its own manager next to its nodes; one of them becomes the
@@ -347,27 +398,44 @@ MANAGER_HOST=nodes-a             # name shown on the dashboard
 MANAGER_PEERS=nodes-b=http://100.64.0.3:8080,proxy-1=http://100.64.0.7:8080
 ```
 
-The hub fetches every peer's nodes in parallel, shows them grouped by host, and
-forwards restarts, logs, and registration to the right server using the shared
-token, under `/api/hosts/NAME/nodes/...`. An unreachable peer is shown as an error
-for that host; the others keep working. Peers may list peers of their own, but
-only their local nodes are relayed, so there are no loops. The mesh provides
-transport encryption; the token provides authorization, and `MANAGER_PEERS`
-refuses to start without one. Allow port 8080 on the mesh interface in the
-host firewall, for example `sudo ufw allow in on wt0 to any port 8080 proto tcp`.
+The hub keeps a cached copy of every peer's listing and refreshes it on its own
+schedule, every `MANAGER_PEER_INTERVAL` seconds (one minute by default), using
+the same background thread as the local probes. A peer answers from its cache,
+so a fetch costs the peer nothing and never probes its nodes; the hub adds the
+fetch age to the sample ages the peer reported, so a remote row's age is the
+true age of its data. The dashboard shows when each host was last fetched. The
+hub forwards restarts, logs, registration, and **Update now** to the right server
+using the shared token, under `/api/hosts/NAME/nodes/...`, and re-fetches that
+peer's listing right after an action so the change is visible at once;
+`POST /api/hosts/NAME/refresh` re-fetches a peer on demand. An unreachable peer
+is shown as a red **unreachable** group with its last fetched rows kept, marked
+with their age; the others keep working. Peers may list peers of their own, but
+a peer only ever answers with its local nodes, so there are no recursive
+lookups and no loops. The mesh provides transport encryption; the token provides
+authorization, and `MANAGER_PEERS` refuses to start without one. Allow port
+8080 on the mesh interface in the host firewall, for example
+`sudo ufw allow in on wt0 to any port 8080 proto tcp`.
+
+A hub does not need nodes of its own: a manager-only host runs just the
+`manager` service (`docker compose up -d --no-build manager`) with
+`MANAGER_PEERS` set. It still needs the Docker socket to identify its Compose
+project and list its (empty) set of node containers, the same token as every
+peer, and a mesh address on which the peers are reachable. Sample ages are
+relative, so the hosts' clocks do not need to agree.
 
 Node data is read through each container's loopback RPC, so a node's `oxend`
 must be running for anything beyond container status to appear; nodes that are
 defined but never started do not appear at all. The dashboard reflects local
 state and does not verify public reachability or reward eligibility.
 
-API: `GET /api/nodes` (local nodes plus a `peers` list), `GET /api/nodes/NAME`,
-`GET /api/nodes/NAME/logs?tail=200`, `GET /api/nodes/NAME/status`,
-`GET /api/nodes/NAME/print_sn_status`, and
-`POST /api/nodes/NAME/{restart,stop,start,register}` with
+API: `GET /api/nodes` (cached local nodes, a `peers` list, and the `polling`
+settings), `GET /api/nodes/NAME`, `GET /api/nodes/NAME/logs?tail=200`,
+`GET /api/nodes/NAME/status`, `GET /api/nodes/NAME/print_sn_status`, and
+`POST /api/nodes/NAME/{refresh,restart,stop,start,register}` with
 `X-Requested-With: session-node-manager`. Registration takes a JSON body
 `{"operator_address": "0x…", "submit": false}`. Prefix a path with
-`/api/hosts/PEER` to address a peer's node through the hub.
+`/api/hosts/PEER` to address a peer's node through the hub, and
+`POST /api/hosts/PEER/refresh` to re-fetch that peer's listing.
 
 ## Updates and backups
 
