@@ -19,7 +19,57 @@ env:
   MANAGER_VERSION: "0.1.0"
 
 jobs:
+  # Each image is built and published only when its own inputs changed, so a manager
+  # release never republishes the node image (and vice versa). The node image's build
+  # context is Dockerfile, entrypoint.sh, and healthcheck.sh (see .dockerignore); the
+  # manager image is the manager directory. The weekly schedule exists to pick up new
+  # node packages, so it always rebuilds the node image; a manual run rebuilds both.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      node: ${{ steps.decide.outputs.node }}
+      manager: ${{ steps.decide.outputs.manager }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect which image inputs changed
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            node:
+              - Dockerfile
+              - entrypoint.sh
+              - healthcheck.sh
+              - .dockerignore
+              - .github/workflows/build.yml
+            manager:
+              - manager/**
+              - .github/workflows/build.yml
+
+      - name: Decide what to build
+        id: decide
+        env:
+          NODE_CHANGED: ${{ steps.filter.outputs.node || 'false' }}
+          MANAGER_CHANGED: ${{ steps.filter.outputs.manager || 'false' }}
+        run: |
+          node=$NODE_CHANGED
+          manager=$MANAGER_CHANGED
+          case "${{ github.event_name }}" in
+            schedule) node=true ;;
+            workflow_dispatch) node=true; manager=true ;;
+          esac
+          echo "node=$node" >> "$GITHUB_OUTPUT"
+          echo "manager=$manager" >> "$GITHUB_OUTPUT"
+          echo "Build node image: $node; build manager image: $manager"
+
   build:
+    needs: changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,9 +80,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: needs.changes.outputs.node == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build image locally
+        if: needs.changes.outputs.node == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -43,13 +95,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Nothing that goes into the node image changed: test against the image that is
+      # already published instead of building, and later republishing, an identical one.
+      - name: Use the published node image
+        if: needs.changes.outputs.node != 'true'
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME,,}:latest"
+          if docker pull "$image"; then
+            docker tag "$image" session-node:local
+          else
+            echo "::warning::No published node image at $image; building one for the tests"
+            docker build --pull -t session-node:local .
+          fi
+
       - name: Build management image
         run: docker build -t session-node-manager:local manager
 
       - name: Test management API against a fake Docker socket
         run: python3 tests/test_manager.py
 
+      # Exercises the packaged daemons inside the node image; a published image already passed it.
       - name: Smoke test packaged services
+        if: needs.changes.outputs.node == 'true'
         run: bash tests/container-smoke.sh session-node:local
 
       - name: Smoke test management dashboard with real containers
@@ -75,6 +142,7 @@ jobs:
 
       - name: Derive image version from installed Session Node
         id: version
+        if: needs.changes.outputs.node == 'true'
         run: |
           PACKAGE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node)
           # Drop an optional Debian epoch and packaging/distribution suffix:
@@ -95,7 +163,7 @@ jobs:
           echo "Session Node package: ${PACKAGE_VERSION}; image: ${IMAGE_VERSION}"
 
       - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && (needs.changes.outputs.node == 'true' || needs.changes.outputs.manager == 'true')
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -104,6 +172,7 @@ jobs:
 
       - name: Generate tags
         id: meta
+        if: needs.changes.outputs.node == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -115,6 +184,7 @@ jobs:
 
       - name: Generate management image tags
         id: manager_meta
+        if: needs.changes.outputs.manager == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-manager
@@ -125,16 +195,21 @@ jobs:
 
       # Publish the exact images inspected above, avoiding a second build that
       # could select a different set of packages.
-      - name: Push tested images
-        if: github.event_name != 'pull_request'
+      - name: Push tested node image
+        if: github.event_name != 'pull_request' && needs.changes.outputs.node == 'true'
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          MANAGER_TAGS: ${{ steps.manager_meta.outputs.tags }}
         run: |
           while IFS= read -r tag; do
             docker tag session-node:local "$tag"
             docker push "$tag"
           done <<< "$IMAGE_TAGS"
+
+      - name: Push tested management image
+        if: github.event_name != 'pull_request' && needs.changes.outputs.manager == 'true'
+        env:
+          MANAGER_TAGS: ${{ steps.manager_meta.outputs.tags }}
+        run: |
           while IFS= read -r tag; do
             docker tag session-node-manager:local "$tag"
             docker push "$tag"
