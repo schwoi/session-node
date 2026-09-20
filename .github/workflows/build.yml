@@ -15,11 +15,72 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   # Increment for container changes that keep the same upstream node version.
   IMAGE_REVISION: "0"
-  # Management dashboard image; versioned independently of the node packages.
-  MANAGER_VERSION: "0.1.0"
+  # The management image's version lives in manager/VERSION, so bumping it is a
+  # manager-only change and does not republish the node image.
 
 jobs:
+  # Each image is published only when its own inputs changed, so a manager-only change
+  # never republishes the node image (and vice versa). The node image's inputs are its
+  # build context (Dockerfile, entrypoint.sh, healthcheck.sh, as selected by
+  # .dockerignore) plus .dockerignore itself and this workflow, which holds the build
+  # recipe and IMAGE_REVISION; the manager image's inputs are the manager directory
+  # (including manager/VERSION) and this workflow. Editing this workflow therefore
+  # republishes both. When the node inputs did not change, the tests run against the
+  # published node image, building a throwaway one only if none is published yet; the
+  # manager image is cheap and is always built for the tests, but pushed only when its
+  # inputs changed. The weekly schedule exists to pick up new node packages, so it always
+  # rebuilds the node image; a manual run rebuilds both.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      node: ${{ steps.decide.outputs.node }}
+      manager: ${{ steps.decide.outputs.manager }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # paths-filter diffs against the previous push, which a shallow clone may lack;
+          # scheduled and manual runs need no history. (0 is falsy in expressions, so the
+          # shallow case must be the truthy branch.)
+          fetch-depth: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 1 || 0 }}
+
+      - name: Detect which image inputs changed
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            node:
+              - Dockerfile
+              - entrypoint.sh
+              - healthcheck.sh
+              - .dockerignore
+              - .github/workflows/build.yml
+            manager:
+              - manager/**
+              - .github/workflows/build.yml
+
+      - name: Decide what to build
+        id: decide
+        env:
+          NODE_CHANGED: ${{ steps.filter.outputs.node || 'false' }}
+          MANAGER_CHANGED: ${{ steps.filter.outputs.manager || 'false' }}
+        run: |
+          node=$NODE_CHANGED
+          manager=$MANAGER_CHANGED
+          case "${{ github.event_name }}" in
+            schedule) node=true ;;
+            workflow_dispatch) node=true; manager=true ;;
+          esac
+          echo "node=$node" >> "$GITHUB_OUTPUT"
+          echo "manager=$manager" >> "$GITHUB_OUTPUT"
+          echo "Build node image: $node; build manager image: $manager"
+
   build:
+    needs: changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,10 +90,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Before anything pulls or pushes. Best effort: a pull request's token may not be
+      # allowed to log in, and a public package can still be pulled without it.
+      - name: Log in to GitHub Container Registry
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up Docker Buildx
+        if: needs.changes.outputs.node == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build image locally
+        if: needs.changes.outputs.node == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -43,13 +116,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Nothing that goes into the node image changed: test against the image that is
+      # already published instead of building, and later republishing, an identical one.
+      - name: Use the published node image
+        id: published
+        if: needs.changes.outputs.node != 'true'
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME,,}:latest"
+          if docker pull "$image"; then
+            docker tag "$image" session-node:local
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not pull $image (not published yet, or the registry was not reachable); building a node image for the tests"
+            docker build --pull -t session-node:local .
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build management image
         run: docker build -t session-node-manager:local manager
 
       - name: Test management API against a fake Docker socket
         run: python3 tests/test_manager.py
 
+      # Exercises the packaged daemons inside the node image. A published image already
+      # passed it; any image built in this run, including the fallback above, must.
       - name: Smoke test packaged services
+        if: needs.changes.outputs.node == 'true' || steps.published.outputs.built == 'true'
         run: bash tests/container-smoke.sh session-node:local
 
       - name: Smoke test management dashboard with real containers
@@ -75,6 +167,7 @@ jobs:
 
       - name: Derive image version from installed Session Node
         id: version
+        if: needs.changes.outputs.node == 'true'
         run: |
           PACKAGE_VERSION=$(docker run --rm --entrypoint dpkg-query session-node:local -W -f='${Version}' session-service-node)
           # Drop an optional Debian epoch and packaging/distribution suffix:
@@ -94,16 +187,9 @@ jobs:
           echo "image_version=${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Session Node package: ${PACKAGE_VERSION}; image: ${IMAGE_VERSION}"
 
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Generate tags
         id: meta
+        if: needs.changes.outputs.node == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -113,28 +199,45 @@ jobs:
             type=raw,value=${{ steps.version.outputs.node_version }},enable={{is_default_branch}}
             type=sha
 
+      - name: Read management image version
+        id: manager_version
+        if: needs.changes.outputs.manager == 'true'
+        run: |
+          version=$(tr -d '[:space:]' < manager/VERSION)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::manager/VERSION must be MAJOR.MINOR.PATCH, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Generate management image tags
         id: manager_meta
+        if: needs.changes.outputs.manager == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-manager
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ env.MANAGER_VERSION }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.manager_version.outputs.version }},enable={{is_default_branch}}
             type=sha
 
       # Publish the exact images inspected above, avoiding a second build that
       # could select a different set of packages.
-      - name: Push tested images
-        if: github.event_name != 'pull_request'
+      - name: Push tested node image
+        if: github.event_name != 'pull_request' && needs.changes.outputs.node == 'true'
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          MANAGER_TAGS: ${{ steps.manager_meta.outputs.tags }}
         run: |
           while IFS= read -r tag; do
             docker tag session-node:local "$tag"
             docker push "$tag"
           done <<< "$IMAGE_TAGS"
+
+      - name: Push tested management image
+        if: github.event_name != 'pull_request' && needs.changes.outputs.manager == 'true'
+        env:
+          MANAGER_TAGS: ${{ steps.manager_meta.outputs.tags }}
+        run: |
           while IFS= read -r tag; do
             docker tag session-node-manager:local "$tag"
             docker push "$tag"

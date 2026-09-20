@@ -25,7 +25,15 @@ upstream portion updates automatically when newer stable packages are installed;
 the container revision stays at its configured value until explicitly changed.
 CI also publishes the `11.6.1`, `latest`, and commit-SHA aliases. Scheduled rebuilds
 can refresh dependencies under the same tags; use an image digest when you need
-an exact, immutable build.
+an exact, immutable build. Each image is published only when its own inputs
+change: the node image when `Dockerfile`, `entrypoint.sh`, `healthcheck.sh`,
+`.dockerignore`, or the workflow file changes, and on the weekly schedule; the
+manager image when the `manager` directory (its version is `manager/VERSION`)
+or the workflow file changes. Other runs test against the published node image
+and build a throwaway one only if none is published yet; the manager image is
+always built for the tests. A manual workflow run rebuilds and publishes both.
+A manager-only change therefore never republishes the node image, and
+`docker compose pull` leaves an unchanged node image alone.
 
 After publication, select a version by setting this in `.env` and pulling it:
 
@@ -448,7 +456,7 @@ docker compose up -d --no-build oxen00
 docker compose exec oxen00 dpkg-query -W session-service-node oxen-storage-server lokinet-router session-router-relay
 ```
 
-For registry installations, use `docker compose pull` and recreate instead. CI rebuilds weekly with the package stage cache disabled and pushes the exact inspected image. Updates are not automatically applied to running containers. Preserve the previous image digest and data backup for recovery; package upgrades can change database formats, so do not assume an older image can read upgraded data.
+For registry installations, use `docker compose pull` and recreate instead. CI rebuilds weekly with the package stage cache disabled and pushes the exact inspected image; other commits republish only the image whose sources changed. Updates are not automatically applied to running containers. Preserve the previous image digest and data backup for recovery; package upgrades can change database formats, so do not assume an older image can read upgraded data.
 
 ## Validation
 
