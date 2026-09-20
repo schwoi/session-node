@@ -626,6 +626,24 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual({key[1]: when - clock.now() for key, when in collector.due.items()},
                          {'oxen00': 100, 'stagenet00': 200, 'l2proxy': 300})
 
+    def test_start_lists_every_service_as_pending_before_sampling(self):
+        mgr = manager.Manager(manager.Docker(self.socket_path), PROJECT, 'manager', interval=3600, peer_interval=3600,
+                              peers={'remote': f'http://127.0.0.1:{self.peer.server_port}'})
+        mgr.collector.start()  # plans synchronously, so the first request already sees every service
+        try:
+            overview = mgr.overview()
+            self.assertEqual([node['name'] for node in overview['nodes']], ['l2proxy', 'oxen00', 'stagenet00'])
+            self.assertEqual([peer['host'] for peer in overview['peers']], ['remote'])
+            self.assertTrue(all(node['sample']['status'] in ('pending', 'ok') for node in overview['nodes']))
+        finally:
+            mgr.collector.stop()
+        # Before its first sample a service is pending, not updating: no data, nothing failed.
+        mgr, collector, clock = self.collector()
+        collector.plan()
+        node = collector.view(('node', 'oxen00'))
+        self.assertEqual((node['state'], node['sample']['status'], node['sample']['pending'], node['sample']['age']),
+                         ('pending', 'pending', True, None))
+
     def test_listing_failure_is_retried_without_touching_the_cache(self):
         mgr, collector, clock = self.collector()
         self.fill(collector)

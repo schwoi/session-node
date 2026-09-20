@@ -591,6 +591,11 @@ class Collector:
                 self.wake.clear()
 
     def start(self):
+        """Plan once so every service is listed as pending before the first request, then sample."""
+        try:
+            self.plan()
+        except (DockerError, OSError) as error:
+            print(f'Container listing failed at start; retrying in the background: {error}', file=sys.stderr, flush=True)
         self.thread = threading.Thread(target=self.run, name='collector', daemon=True)
         self.thread.start()
 

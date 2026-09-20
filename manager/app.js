@@ -228,7 +228,11 @@ function ageText(seconds) {
    failed; the data shown is older), stale (the manager missed a round), or simply its age. */
 function sampleInfo(sample) {
   if (!sample) return null;
-  if (sample.pending) return { tone: 'sync', label: 'updating…', title: sample.age == null ? 'Waiting for the first sample' : `Sample ${ageText(sample.age)} old; a new one is on its way` };
+  if (sample.status === 'pending') return { tone: 'sync', label: 'pending', title: 'Waiting for the first sample since the manager started' };
+  if (sample.pending) {
+    return { tone: 'sync', label: 'updating…',
+      title: sample.age == null ? 'A new sample is on its way' : `Sample ${ageText(sample.age)} old; a new one is on its way` };
+  }
   if (sample.status === 'failed') {
     return { tone: 'bad', label: sample.age == null ? 'failed' : `failed · ${ageText(sample.age)}`,
       title: `Last update failed: ${sample.error || 'unknown error'}${sample.age == null ? '' : `. Showing the sample from ${ageText(sample.age)} ago.`}` };
@@ -594,7 +598,8 @@ function renderDrawer() {
   const info = sampleInfo(service.sample);
   if (info) {
     const line = element('div', `sample${info.tone ? ` is-${info.tone}` : ''}`);
-    const what = service.sample.pending ? (service.sample.age == null ? 'Waiting for the first sample' : `Updating · showing the sample from ${duration(service.sample.age)} ago`)
+    const what = service.sample.status === 'pending' ? 'Waiting for the first sample'
+      : service.sample.pending ? (service.sample.age == null ? 'Updating' : `Updating · showing the sample from ${duration(service.sample.age)} ago`)
       : service.sample.status === 'failed' ? `Last update failed${service.sample.age == null ? '' : ` · showing the sample from ${duration(service.sample.age)} ago`}`
         : service.sample.status === 'stale' ? `Stale · sampled ${duration(service.sample.age)} ago, the manager missed a round`
           : `Sampled ${duration(service.sample.age)} ago`;
