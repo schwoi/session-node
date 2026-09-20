@@ -681,7 +681,9 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(collector.running)
         self.assertTrue(collector.view(key)['sample']['pending'])
         collector.abandon()  # nothing running: harmless
-        self.assertEqual(collector.step(), 0)  # the scheduled sample then clears the pending flag
+        self.assertGreater(collector.due[key], clock.now())  # the schedule was not touched: its slot is ahead
+        clock.advance(collector.due[key] - clock.now())
+        self.assertIn('oxen00', self.fill(collector))  # the scheduled sample then clears the pending flag
         self.assertFalse(collector.view(key)['sample']['pending'])
 
     def test_listing_failure_is_retried_without_touching_the_cache(self):
