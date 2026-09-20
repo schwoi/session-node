@@ -19,8 +19,10 @@ env:
   MANAGER_VERSION: "0.1.0"
 
 jobs:
-  # Each image is built and published only when its own inputs changed, so a manager
-  # release never republishes the node image (and vice versa). The node image's inputs
+  # Each image is published only when its own inputs changed, so a manager release
+  # never republishes the node image (and vice versa). The node image is also built
+  # only then; the manager image is cheap and is always built for the tests, but pushed
+  # only when its inputs changed. The node image's inputs
   # are its build context (Dockerfile, entrypoint.sh, healthcheck.sh, as selected by
   # .dockerignore) plus .dockerignore itself and this workflow, which holds the build
   # recipe and IMAGE_REVISION; the manager image's inputs are the manager directory and

@@ -25,13 +25,14 @@ upstream portion updates automatically when newer stable packages are installed;
 the container revision stays at its configured value until explicitly changed.
 CI also publishes the `11.6.1`, `latest`, and commit-SHA aliases. Scheduled rebuilds
 can refresh dependencies under the same tags; use an image digest when you need
-an exact, immutable build. Each image is built and published only when its own
-inputs change: the node image when `Dockerfile`, `entrypoint.sh`,
-`healthcheck.sh`, `.dockerignore`, or the workflow file change, and on the
-weekly schedule; the manager image when the `manager` directory or the workflow
-file changes. A manual workflow run rebuilds both. A manager release therefore
-never republishes the node image, and `docker compose pull` leaves an unchanged
-node image alone.
+an exact, immutable build. Each image is published only when its own inputs
+change: the node image when `Dockerfile`, `entrypoint.sh`, `healthcheck.sh`,
+`.dockerignore`, or the workflow file change, and on the weekly schedule; the
+manager image when the `manager` directory or the workflow file changes. The
+node image is also built only then (other runs test against the published
+one); the manager image is always built for the tests. A manual workflow run
+rebuilds and publishes both. A manager release therefore never republishes the
+node image, and `docker compose pull` leaves an unchanged node image alone.
 
 After publication, select a version by setting this in `.env` and pulling it:
 
