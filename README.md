@@ -6,7 +6,7 @@ The [official guide](https://docs.getsession.org/contribute-to-the-session-netwo
 
 ## Versions and requirements
 
-The image uses Ubuntu 24.04 LTS and the signed `deb.session.foundation` stable repository. Verified on 16 September 2026: `session-service-node`/`oxend` **11.6.1**, storage **2.11.3**, Lokinet **0.9.14**, Session Router **1.0.2**. Uncached builds select the latest available stable packages, rather than freezing these versions.
+The image uses Ubuntu 24.04 LTS and the signed `deb.session.foundation` stable repository. Verified on 20 October 2026: `session-service-node`/`oxend` **11.7.0**, storage **2.12.0**, Lokinet **0.9.16**, Session Router **1.1.0**. Uncached builds select the latest available stable packages, rather than freezing these versions.
 
 Each mainnet node needs at least 45 GB storage, 4–8 GB RAM, 100 Mb/s connectivity, and 10–20 TB monthly traffic allowance. Allow additional capacity when running multiple nodes. Use Docker Engine with the Compose plugin and a publicly reachable IPv4 address.
 
@@ -273,7 +273,7 @@ docker compose exec stagenet00 oxend --config-file=/etc/oxen/oxen.conf status
 bash node_status.sh
 ```
 
-Follow the registration URL to stake. Before staking, verify full chain/L2 synchronization, externally reachable ports, and healthy storage/router reports. A successful container start alone does not prove network eligibility. The Docker health check verifies local RPC and recent pings from all required companions; it does not require chain synchronization. An unhealthy status needs investigation: Docker restart policies handle process exits, but do not automatically restart a container solely because its health check fails.
+Follow the registration URL to stake. Before staking, verify full chain/L2 synchronization, externally reachable ports, and healthy storage/router reports. A successful container start alone does not prove network eligibility. The Docker health check verifies local RPC and recent pings from all required companions; it does not require chain synchronization. On mainnet, storage, Lokinet, and Session Router start only once oxend has synchronized with its peers, because storage 2.12 exits if oxend is still syncing. Until then, which can take hours on a new node, the container logs `Waiting for oxend to synchronize` and the health check covers oxend alone. An unhealthy status needs investigation: Docker restart policies handle process exits, but do not automatically restart a container solely because its health check fails.
 
 ## Management dashboard
 

@@ -18,11 +18,11 @@ supervision, connectivity, persistence, and updates. [1][2][3]
 
 | Package | Version in the noble repository | Runtime executable |
 | --- | --- | --- |
-| `session-service-node` | `11.6.1-1~ubuntu2404` | Metapackage |
-| `oxend` | `11.6.1-1~ubuntu2404` | `oxend` |
-| `oxen-storage-server` | `2.11.3-1~ubuntu2404` | `oxen-storage` |
-| `lokinet-router` / `lokinet-bin` | `0.9.14-1~ubuntu2404` | `lokinet -r` |
-| `session-router-relay` / `session-router-bin` | `1.0.2-1~ubuntu2404` | `session-router -r` |
+| `session-service-node` | `11.7.0-1~ubuntu2404` | Metapackage |
+| `oxend` | `11.7.0-1~ubuntu2404` | `oxend` |
+| `oxen-storage-server` | `2.12.0-1~ubuntu2404` | `oxen-storage` |
+| `lokinet-router` / `lokinet-bin` | `0.9.16-1~ubuntu2404` | `lokinet -r` |
+| `session-router-relay` / `session-router-bin` | `1.1.0-1~ubuntu2404` | `session-router -r` |
 
 The metapackage requires all four daemons. The package repository is the version
 authority for this installation method: GitHub's latest-release endpoints still
@@ -36,6 +36,11 @@ The guide now uses `https://deb.session.foundation`, with a repository-specific
   requirements. Its uptime-proof code rejects proofs when required companion
   services stop reporting. Each daemon needs supervision and graceful shutdown;
   merely backgrounding storage is insufficient. [5][6]
+- **Storage startup:** Storage 2.12.0 reads oxend's top block at startup and exits
+  after five failed attempts. oxend answers `BUSY` until it has synchronized with
+  its peers, so storage cannot start against a syncing oxend. The packaged unit
+  restarts storage every 5 seconds until then; the container instead starts its
+  companions once oxend reports a top block. [15]
 - **Stagenet:** The same release explicitly disables storage, Lokinet, and
   Session Router on stagenet. It uses P2P 11022, quorumnet 11025, and the default
   network subdirectory `stagenet4` when no explicit data directory is supplied.
@@ -130,3 +135,4 @@ rebuilds the package stage without cache to obtain current stable packages.
 12. [Setting up an oxend L2 proxy](https://docs.getsession.org/contribute-to-the-session-network/running-a-session-node/setting-up-an-oxend-l2-proxy)
 13. [Docker build best practices](https://docs.docker.com/build/building/best-practices/)
 14. [Docker: run multiple processes in a container](https://docs.docker.com/engine/containers/multi-service_container/)
+15. [Storage server 2.12.0 top-block check](https://github.com/session-foundation/session-storage-server/blob/v2.12.0/oxenss/server/omq.cpp)

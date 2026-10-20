@@ -36,17 +36,27 @@ expect_invalid 'must be a port' -e P2P_PORT=70000
 expect_invalid 'public IPv4' -e SERVICE_NODE_IP_ADDRESS=999.1.1.1 -e L2_PROVIDER=http://localhost
 expect_invalid 'placeholder' -e SERVICE_NODE_IP_ADDRESS=8.8.8.8 -e L2_PROVIDER=https://example.com/YOUR_API_KEY
 expect_invalid '64-character hex' -e ROLE=proxy -e L2_PROVIDER=http://localhost -e L2_PROXY_CLIENTS=bad
+# Options for docker run, then optionally -- and a command replacing the image's.
 start() {
-  local name=$1
+  local name=$1 options=()
   shift
+  while (( $# )) && [[ $1 != -- ]]; do options+=("$1"); shift; done
+  (( $# )) && shift
   containers+=("$name")
   docker run -d --name "$name" --network "$network" --security-opt no-new-privileges:true \
-    -e SERVICE_NODE_IP_ADDRESS=8.8.8.8 -e L2_PROVIDER=http://127.0.0.1:8545 "$@" "$image" >/dev/null
+    -e SERVICE_NODE_IP_ADDRESS=8.8.8.8 -e L2_PROVIDER=http://127.0.0.1:8545 \
+    "${options[@]}" "$image" "$@" >/dev/null
 }
+# An isolated oxend never synchronizes, so mainnet companions would never start.
+# Offline mode counts as synchronized, but it also leaves the P2P port closed.
+offline=(oxend --non-interactive --config-file=/etc/oxen/oxen.conf --offline)
+# Healthy with every service started; health alone also passes while companions start.
 await_health() {
   local name=$1
   for ((attempt=0; attempt<120; attempt++)); do
-    if docker exec "$name" /healthcheck.sh >/dev/null 2>&1; then return; fi
+    if docker exec "$name" bash -c 'test -s /run/session-node.pids && /healthcheck.sh' >/dev/null 2>&1; then
+      return
+    fi
     [[ $(docker inspect -f '{{.State.Running}}' "$name") == true ]] || break
     sleep 1
   done
@@ -89,11 +99,29 @@ stop_cleanly() {
   docker stop -t 30 "$1" >/dev/null
   [[ $(docker inspect -f '{{.State.ExitCode}}' "$1") == 0 ]] || fail "$1 did not stop cleanly"
 }
+# Storage exits when oxend is still syncing, taking the container with it, so
+# companions must wait for synchronization however long it takes.
+syncing="$prefix-syncing"
+start "$syncing" --device /dev/net/tun --cap-add NET_ADMIN -e P2P_PORT=22032
+for ((attempt=0; attempt<120; attempt++)); do
+  docker logs "$syncing" 2>&1 | grep -q 'Waiting for oxend to synchronize' && break
+  [[ $(docker inspect -f '{{.State.Running}}' "$syncing") == true ]] || break
+  sleep 1
+done
+docker logs "$syncing" 2>&1 | grep -q 'Waiting for oxend to synchronize' ||
+  { docker logs --tail 50 "$syncing" >&2; fail 'Unsynchronized oxend did not hold back companions'; }
+sleep 10
+[[ $(docker inspect -f '{{.State.Running}}' "$syncing") == true ]] || fail 'Container stopped while oxend was syncing'
+docker exec "$syncing" test ! -e /run/session-node.pids || fail 'Companions started before oxend synchronized'
+# Waiting is expected, not a failure: L2 setup and onboarding wait for health.
+docker exec "$syncing" /healthcheck.sh || fail 'Node waiting for oxend to synchronize is not healthy'
+assert_ports "$syncing" tcp:22032 tcp:22025
+stop_cleanly "$syncing"
 main="$prefix-main"
-start "$main" --device /dev/net/tun --cap-add NET_ADMIN -v "$volume:/var/lib/oxen"
+start "$main" --device /dev/net/tun --cap-add NET_ADMIN -v "$volume:/var/lib/oxen" -- "${offline[@]}"
 await_health "$main"
 assert_processes "$main" 4
-assert_ports "$main" tcp:22020 udp:22020 tcp:22021 tcp:22022 tcp:22025 udp:1090 udp:1190
+assert_ports "$main" tcp:22020 udp:22020 tcp:22021 tcp:22025 udp:1090 udp:1190
 keys_before=$(docker exec "$main" sha256sum /var/lib/oxen/key_ed25519 /var/lib/oxen/key_bls)
 # A companion failure must stop the entire container with a failing exit code.
 docker exec "$main" bash -c 'kill -TERM "$(sed -n "2p" /run/session-node.pids)"'
@@ -119,7 +147,7 @@ chmod 0755 "$delay_wrapper"
 start "$main" --device /dev/net/tun --cap-add NET_ADMIN -v "$volume:/var/lib/oxen" \
   -v "$delay_wrapper:/usr/local/bin/oxend:ro" \
   -e P2P_PORT=22032 -e QUORUMNET_PORT=22035 -e STORAGE_LMQ_PORT=22030 \
-  -e STORAGE_HTTPS_PORT=22031 -e LOKINET_PORT=1091 -e SESSION_ROUTER_PORT=1191
+  -e STORAGE_HTTPS_PORT=22031 -e LOKINET_PORT=1091 -e SESSION_ROUTER_PORT=1191 -- "${offline[@]}"
 for ((attempt=0; attempt<10; attempt++)); do
   docker exec "$main" test -e /var/lib/oxen/oxend-delay-started && break
   sleep 1
@@ -129,7 +157,7 @@ docker exec "$main" test ! -e /run/session-node.pids || fail 'Companions started
 await_health "$main"
 assert_processes "$main" 4
 [[ $(docker exec "$main" sha256sum /var/lib/oxen/key_ed25519 /var/lib/oxen/key_bls) == "$keys_before" ]] || fail 'Node identity changed on recreation'
-assert_ports "$main" tcp:22030 udp:22030 tcp:22031 tcp:22032 tcp:22035 udp:1091 udp:1191
+assert_ports "$main" tcp:22030 udp:22030 tcp:22031 tcp:22035 udp:1091 udp:1191
 stop_cleanly "$main"
 stage="$prefix-stage"
 start "$stage" -e NETWORK=stagenet
@@ -146,4 +174,4 @@ assert_processes "$proxy" 1
 assert_ports "$proxy" tcp:22125
 docker exec "$proxy" bash -c 'set -e; curl -fsS http://127.0.0.1:22023/get_info | jq -e '\''.service_node == false'\'' >/dev/null; test "$(wc -l < /etc/oxen/proxy.txt)" = 1'
 stop_cleanly "$proxy"
-echo 'PASS: invalid config, mainnet services, offset ports, persisted keys, delayed restart with stale socket, service failure, stagenet, proxy, graceful shutdown'
+echo 'PASS: invalid config, wait for oxend sync, mainnet services, offset ports, persisted keys, delayed restart with stale socket, service failure, stagenet, proxy, graceful shutdown'
