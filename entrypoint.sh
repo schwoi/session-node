@@ -130,6 +130,8 @@ trap 'stop_services; exit 0' TERM INT
 trap stop_services EXIT
 start() { gosu _loki "$@" & pids+=("$!"); }
 
+# A restarted container keeps these files from its previous run.
+rm -f /run/session-node.pids /run/session-node.syncing
 start "$@"
 if [[ $ROLE == node && $NETWORK == mainnet ]]; then
   [[ -c /dev/net/tun ]] || fail 'Mainnet routers require --device /dev/net/tun and --cap-add NET_ADMIN'
@@ -191,6 +193,24 @@ CONFIG
     sleep 1
   done
   (( ready )) || fail 'Timed out waiting for oxend RPC readiness'
+  # Storage 2.12+ exits after a few seconds if oxend cannot report its top block,
+  # which oxend refuses (BUSY) until it has synchronized with its peers. The native
+  # unit restarts storage until then; here its exit would stop oxend too, so wait
+  # for sync, however long an initial sync takes. Until the companions are running,
+  # the health check covers oxend alone.
+  echo "${pids[0]}" > /run/session-node.syncing
+  oxend_synced() {
+    curl --fail --silent --max-time 5 http://127.0.0.1:22023/json_rpc \
+      -d '{"jsonrpc":"2.0","id":0,"method":"get_last_block_header"}' |
+      jq -e '.result.status == "OK"' > /dev/null 2>&1
+  }
+  if ! oxend_synced; then
+    echo '[config] Waiting for oxend to synchronize before starting companion services'
+    until oxend_synced; do
+      kill -0 "${pids[0]}" 2>/dev/null || fail 'oxend exited while synchronizing'
+      sleep 5
+    done
+  fi
   start oxen-storage --config-file /etc/oxen/storage.conf
   # Match the native router units' capabilities while retaining an unprivileged UID.
   for router in lokinet session-router; do
@@ -219,6 +239,7 @@ CONFIG
 fi
 
 printf '%s\n' "${pids[@]}" > /run/session-node.pids
+rm -f /run/session-node.syncing
 echo "[config] Started $NETWORK $ROLE (${#pids[@]} services)"
 # Exit on any service failure so Docker's restart policy restarts the whole node.
 status=0
